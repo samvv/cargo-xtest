@@ -3,6 +3,7 @@
 
 mod fixtures;
 pub mod gc;
+pub mod memory;
 pub mod sandbox;
 mod session;
 pub mod store;

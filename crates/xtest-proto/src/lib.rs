@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped whenever the messages below change incompatibly.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 3;
 
 /// Largest frame we accept. Blob uploads are chunked well below this.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -78,7 +78,12 @@ pub enum Request {
         name: String,
         role: Role,
         spec: FixtureSpec,
+        /// Used by a single test only (test scope). Lets the agent measure
+        /// a container's whole peak memory as that test's peak.
+        exclusive: bool,
     },
+    /// Current memory situation. Answered with [`Reply::Memory`].
+    Memory,
     Teardown {
         lease: u64,
     },
@@ -124,6 +129,25 @@ pub enum Role {
 pub enum FixtureSpec {
     Docker(DockerSpec),
     Command(CommandSpec),
+    K3d(K3dSpec),
+}
+
+/// A Kubernetes cluster made with `k3d cluster create`. Tests get its
+/// kubeconfig in `KUBECONFIG`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct K3dSpec {
+    pub servers: u32,
+    pub agents: u32,
+    /// k3s image, e.g. `rancher/k3s:v1.31.4-k3s1`.
+    pub image: Option<String>,
+    /// Extra arguments for `k3d cluster create`.
+    pub args: Vec<String>,
+    /// How long `k3d cluster create --wait` may take.
+    pub timeout: Duration,
+    /// Run on the host until it succeeds; may use `{cluster}` and `{kubeconfig}`.
+    pub ready: Option<Ready>,
+    /// Env vars exported to tests; may use `{cluster}` and `{kubeconfig}`.
+    pub export: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,7 +198,13 @@ pub struct CommandSpec {
 pub enum AgentMsg {
     Reply { req: u64, result: Result<Reply, String> },
     Output { req: u64, stream: Stream, data: Vec<u8> },
-    Exited { req: u64, status: Exit, duration: Duration },
+    Exited {
+        req: u64,
+        status: Exit,
+        duration: Duration,
+        /// Peak memory of the process (and of its container, if it ran in one), in bytes.
+        peak_memory: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +217,7 @@ pub enum Reply {
         /// Shown to the user when a lease is kept for debugging.
         debug_hint: Option<String>,
     },
+    Memory(MemoryInfo),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +230,15 @@ pub struct HostInfo {
     /// Whether processes can see the sandbox at the original paths.
     pub mirroring: bool,
     pub docker: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryInfo {
+    /// `MemAvailable` from `/proc/meminfo`, in bytes.
+    pub available: u64,
+    pub total: u64,
+    /// Memory each running process (by `Spawn` request id) uses right now, in bytes.
+    pub running: BTreeMap<u64, u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -31,3 +31,17 @@ export = { REDIS_ADDR = "{host}:{port:6379}" }
 [fixture.borg]
 kind = "docker"
 build = { dockerfile = "tests/docker/borg.Dockerfile", context = "tests/docker" }
+
+# `cargo xtest --profile k8s`: needs k3d and docker on the host.
+[[profile.k8s.overrides]]
+filter = "binary(k8s)"
+uses = ["k8s"]
+include-ignored = true
+
+[fixture.k8s]
+kind = "k3d"
+scope = "run"
+agents = 1
+args = ["--no-lb"]
+ready = { cmd = "docker exec k3d-{cluster}-server-0 kubectl wait --for=condition=Ready nodes --all --timeout=10s", timeout = "180s" }
+export = { K3D_CLUSTER = "{cluster}" }

@@ -11,12 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
 use tokio::sync::mpsc;
 use xtest_proto::*;
 
 use crate::sandbox::{Mirror, Plan};
+use crate::memory::{self, Sampler};
 use crate::{fixtures, gc, sandbox, store::Store};
 
 pub struct Session {
@@ -34,20 +36,38 @@ pub struct Session {
 #[derive(Default)]
 struct State {
     mirrors: Vec<PathBuf>,
-    /// Running processes: request id -> process group id.
-    procs: HashMap<u64, i32>,
+    /// Running processes by request id.
+    procs: HashMap<u64, Proc>,
     leases: HashMap<u64, Lease>,
+}
+
+struct Proc {
+    pgid: i32,
+    /// Set when the process runs in a container: its memory is measured there.
+    cgroup: Option<PathBuf>,
+    /// The container is used by this process only, so all of it counts.
+    exclusive: bool,
 }
 
 pub struct Lease {
     pub kind: LeaseKind,
     pub env: BTreeMap<String, String>,
     /// Set for environment leases: processes using it run in this container.
-    pub container: Option<String>,
+    pub container: Option<Container>,
+}
+
+#[derive(Clone)]
+pub struct Container {
+    pub name: String,
+    pub cgroup: Option<PathBuf>,
+    /// Only one test uses it, so the container's peak is that test's peak.
+    pub exclusive: bool,
 }
 
 pub enum LeaseKind {
     Container(String),
+    /// A k3d cluster, by name.
+    K3d(String),
     Command { teardown: Option<String>, cwd: PathBuf },
 }
 
@@ -172,14 +192,18 @@ impl Session {
                 tokio::spawn(async move { self.run(req, spec).await });
             }
             Request::Kill { id } => {
-                if let Some(pgid) = self.state.lock().unwrap().procs.get(&id) {
-                    kill_group(*pgid);
+                if let Some(p) = self.state.lock().unwrap().procs.get(&id) {
+                    kill_group(p.pgid);
                 }
                 self.reply(req, Ok(Reply::Ok));
             }
-            Request::Setup { lease, name, role, spec } => {
+            Request::Memory => {
+                let res = self.memory();
+                self.reply(req, res.map(Reply::Memory).map_err(|e| e.to_string()));
+            }
+            Request::Setup { lease, name, role, spec, exclusive } => {
                 tokio::spawn(async move {
-                    let res = fixtures::setup(&self, lease, &name, role, spec).await;
+                    let res = fixtures::setup(&self, lease, &name, role, spec, exclusive).await;
                     self.reply(req, res.map_err(err));
                 });
             }
@@ -207,6 +231,32 @@ impl Session {
 
     pub fn add_lease(&self, id: u64, lease: Lease) {
         self.state.lock().unwrap().leases.insert(id, lease);
+    }
+
+    fn memory(&self) -> std::io::Result<MemoryInfo> {
+        let (available, total) = memory::meminfo()?;
+        let procs: Vec<(u64, i32, Option<PathBuf>, bool)> = self
+            .state
+            .lock()
+            .unwrap()
+            .procs
+            .iter()
+            .map(|(r, p)| (*r, p.pgid, p.cgroup.clone(), p.exclusive))
+            .collect();
+        let pgids = procs.iter().filter(|p| p.2.is_none()).map(|p| p.1).collect();
+        let rss = memory::pgroup_rss(&pgids);
+        let running = procs
+            .into_iter()
+            .map(|(req, pgid, cgroup, exclusive)| {
+                let used = match (cgroup, exclusive) {
+                    (Some(cg), true) => memory::read_u64(&cg.join("memory.current")).unwrap_or(0),
+                    (Some(cg), false) => memory::tagged_rss(&cg, req),
+                    (None, _) => rss.get(&pgid).copied().unwrap_or(0),
+                };
+                (req, used)
+            })
+            .collect();
+        Ok(MemoryInfo { available, total, running })
     }
 
     fn materialize(&self, mirrors: Vec<PathBuf>, files: &[FileEntry]) -> Result<()> {
@@ -278,11 +328,11 @@ impl Session {
             cmd = Command::new(self.view(exe, false));
             cmd.args(args).current_dir(self.view(cwd, false)).envs(env);
         }
-        cmd.process_group(0).stdin(Stdio::null()).kill_on_drop(true);
+        cmd.process_group(0).stdin(Stdio::null());
         cmd
     }
 
-    fn lease_env(&self, leases: &[u64]) -> Result<(BTreeMap<String, String>, Option<String>)> {
+    fn lease_env(&self, leases: &[u64]) -> Result<(BTreeMap<String, String>, Option<Container>)> {
         let state = self.state.lock().unwrap();
         let mut env = BTreeMap::new();
         let mut container = None;
@@ -300,65 +350,89 @@ impl Session {
 
     async fn run(&self, req: u64, spec: SpawnSpec) {
         let start = Instant::now();
-        let exit = self.run_inner(req, spec).await.unwrap_or_else(|e| Exit::SpawnFailed(format!("{e:#}")));
+        let (status, peak_memory) = self
+            .run_inner(req, spec)
+            .await
+            .unwrap_or_else(|e| (Exit::SpawnFailed(format!("{e:#}")), None));
         self.state.lock().unwrap().procs.remove(&req);
-        self.send(AgentMsg::Exited { req, status: exit, duration: start.elapsed() });
+        self.send(AgentMsg::Exited { req, status, duration: start.elapsed(), peak_memory });
     }
 
-    async fn run_inner(&self, req: u64, spec: SpawnSpec) -> Result<Exit> {
+    async fn run_inner(&self, req: u64, spec: SpawnSpec) -> Result<(Exit, Option<u64>)> {
         let tmp = self.run_dir.join("tmp").join(req.to_string());
         fs::create_dir_all(&tmp)?;
         let (lease_env, container) = self.lease_env(&spec.leases)?;
         let mut env = spec.env.clone();
         env.extend(lease_env);
         env.insert("TMPDIR".into(), tmp.display().to_string());
+        // Lets the agent find this test's processes inside a shared container.
+        env.insert("XTEST_REQ".into(), req.to_string());
 
-        let mut cmd = self.build_command(&spec.exe, &spec.args, &spec.cwd, &env, container.as_deref());
+        let ctr_name = container.as_ref().map(|c| c.name.as_str());
+        let mut cmd = self.build_command(&spec.exe, &spec.args, &spec.cwd, &env, ctr_name);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn().with_context(|| format!("spawning {}", spec.exe.display()))?;
-        let pgid = child.id().context("child has no pid")? as i32;
-        self.state.lock().unwrap().procs.insert(req, pgid);
+        let pid = child.id() as i32;
+        let cgroup = container.as_ref().and_then(|c| c.cgroup.clone());
+        let exclusive = container.as_ref().is_some_and(|c| c.exclusive);
+        self.state.lock().unwrap().procs.insert(req, Proc { pgid: pid, cgroup: cgroup.clone(), exclusive });
 
-        let pumps = tokio::spawn({
-            let out = child.stdout.take().unwrap();
-            let err = child.stderr.take().unwrap();
-            let tx = self.out.clone();
-            async move {
-                tokio::join!(pump(out, req, Stream::Stdout, &tx), pump(err, req, Stream::Stderr, &tx));
-            }
-        });
+        let pumps = [
+            pump(child.stdout.take().unwrap(), req, Stream::Stdout, self.out.clone()),
+            pump(child.stderr.take().unwrap(), req, Stream::Stderr, self.out.clone()),
+        ];
+        // Reaped with wait4 below, which also reports peak memory.
+        drop(child);
+        let sampler = cgroup.clone().filter(|_| !exclusive).map(|cg| Sampler::start(cg, req));
 
-        let status = match spec.timeout {
-            Some(t) => match tokio::time::timeout(t, child.wait()).await {
-                Ok(s) => Some(s?),
+        let mut waiter = tokio::task::spawn_blocking(move || memory::wait4(pid));
+        let (waited, timed_out) = match spec.timeout {
+            Some(t) => match tokio::time::timeout(t, &mut waiter).await {
+                Ok(r) => (r, false),
                 Err(_) => {
-                    kill_group(pgid);
-                    let _ = child.wait().await;
-                    None
+                    kill_group(pid);
+                    (waiter.await, true)
                 }
             },
-            None => Some(child.wait().await?),
+            None => (waiter.await, false),
         };
+        let (status, max_rss) = waited.context("waiting for process")??;
         // Stragglers in the group would keep the pipes open.
-        kill_group(pgid);
-        let _ = tokio::time::timeout(Duration::from_secs(2), pumps).await;
+        kill_group(pid);
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            for p in pumps {
+                let _ = p.await;
+            }
+        })
+        .await;
         let _ = gc::remove_tree(&tmp);
 
-        use std::os::unix::process::ExitStatusExt;
-        Ok(match status {
-            None => Exit::Timeout,
-            Some(s) => match (s.code(), s.signal()) {
-                (Some(c), _) => Exit::Code(c),
-                (None, Some(sig)) => Exit::Signal(sig),
-                _ => Exit::Code(-1),
-            },
-        })
+        let peak = match (&container, sampler) {
+            (None, _) => Some(max_rss),
+            // A container of its own: its whole peak is this test's.
+            (Some(_), None) if exclusive => cgroup.and_then(|cg| memory::read_u64(&cg.join("memory.peak"))),
+            (Some(_), Some(s)) => s.finish().await,
+            // No cgroup to look at. Only the `docker exec` client is our
+            // child, so its RSS means nothing.
+            (Some(_), None) => None,
+        };
+
+        let exit = if timed_out {
+            Exit::Timeout
+        } else if libc::WIFEXITED(status) {
+            Exit::Code(libc::WEXITSTATUS(status))
+        } else if libc::WIFSIGNALED(status) {
+            Exit::Signal(libc::WTERMSIG(status))
+        } else {
+            Exit::Code(-1)
+        };
+        Ok((exit, peak))
     }
 
     async fn cleanup(&self, keep: &[u64]) {
         let (procs, leases) = {
             let mut st = self.state.lock().unwrap();
-            let procs: Vec<i32> = st.procs.values().copied().collect();
+            let procs: Vec<i32> = st.procs.values().map(|p| p.pgid).collect();
             (procs, st.leases.drain().collect::<Vec<_>>())
         };
         for pgid in procs {
@@ -383,21 +457,23 @@ impl Session {
     }
 }
 
-async fn pump(
-    mut r: impl AsyncRead + Unpin,
+fn pump(
+    mut r: impl Read + Send + 'static,
     req: u64,
     stream: Stream,
-    tx: &mpsc::UnboundedSender<Option<AgentMsg>>,
-) {
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        match r.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let _ = tx.send(Some(AgentMsg::Output { req, stream, data: buf[..n].to_vec() }));
+    tx: mpsc::UnboundedSender<Option<AgentMsg>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let _ = tx.send(Some(AgentMsg::Output { req, stream, data: buf[..n].to_vec() }));
+                }
             }
         }
-    }
+    })
 }
 
 fn kill_group(pgid: i32) {

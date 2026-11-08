@@ -6,6 +6,7 @@ mod client;
 mod config;
 mod files;
 mod filter;
+mod history;
 mod runner;
 
 use std::collections::HashMap;
@@ -17,11 +18,12 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use sha2::{Digest, Sha256};
-use xtest_proto::{CommandSpec, DockerSpec, FixtureSpec, ImageSource, Ready};
+use xtest_proto::{CommandSpec, DockerSpec, FixtureSpec, ImageSource, K3dSpec, Ready};
 
 use crate::config::{Config, FixtureKind, Host};
 use crate::filter::{Filter, Subject};
-use crate::runner::{Case, Ctx, FixtureDef, HostState, Reporter};
+use crate::config::format_size;
+use crate::runner::{Case, Ctx, FixtureDef, HostState, MemorySource, Reporter};
 
 #[derive(Parser, Debug)]
 #[command(name = "cargo xtest", version, about = "Run cargo tests on other hosts and inside fixtures")]
@@ -104,6 +106,7 @@ fn run(args: Args) -> Result<ExitCode> {
     })?;
     let files = files::collect(&ws.root, &ws.target_dir, &profile.include, &built.executables)?;
     let fixtures = fixture_defs(&cfg, &ws.root, &files)?;
+    let mut history = history::History::load(&ws.target_dir);
 
     let width = hosts.iter().map(|h| h.name.len()).max().unwrap_or(5);
     let reporter = Reporter::new(width);
@@ -163,7 +166,20 @@ fn run(args: Args) -> Result<ExitCode> {
             let mut skipped = 0;
             for (bin, name, ignored) in found {
                 let subject = Subject { package: &bin.package, binary: &bin.name, kind: &bin.kind, test: &name };
-                let mut case = Case { bin: bin.clone(), name: name.clone(), ignored, run_in: None, uses: vec![], timeout: profile.timeout };
+                let mut case = Case {
+                    bin: bin.clone(),
+                    name: name.clone(),
+                    ignored,
+                    run_in: None,
+                    uses: vec![],
+                    timeout: profile.timeout,
+                    memory: profile.memory,
+                    memory_source: MemorySource::Default,
+                };
+                if let Some(&peak) = history.peaks.get(&case.display()) {
+                    case.memory = peak;
+                    case.memory_source = MemorySource::Measured;
+                }
                 let mut include_ignored = args.include_ignored;
                 for (f, o) in &profile.overrides {
                     if f.matches(&subject) {
@@ -176,6 +192,10 @@ fn run(args: Args) -> Result<ExitCode> {
                         }
                         if let Some(t) = &o.timeout {
                             case.timeout = Some(config::parse_duration(t)?);
+                        }
+                        if let Some(m) = &o.memory {
+                            case.memory = config::parse_size(m)?;
+                            case.memory_source = MemorySource::Config;
                         }
                     }
                 }
@@ -192,7 +212,12 @@ fn run(args: Args) -> Result<ExitCode> {
 
             if args.list {
                 for c in &cases {
-                    let mut extra = String::new();
+                    let source = match c.memory_source {
+                        MemorySource::Config => "config",
+                        MemorySource::Measured => "measured",
+                        MemorySource::Default => "default",
+                    };
+                    let mut extra = format!(" [memory: {} ({source})]", format_size(c.memory));
                     if let Some(e) = &c.run_in {
                         extra += &format!(" [run-in: {e}]");
                     }
@@ -205,8 +230,21 @@ fn run(args: Args) -> Result<ExitCode> {
             }
 
             let slots: usize = hosts.iter().map(|h| h.slots).sum();
-            reporter.status("Starting", &format!("{} tests across {slots} slots ({skipped} skipped)", cases.len()));
-            let ctx = Arc::new(Ctx { fixtures, keep_fixtures: args.keep_fixtures, reporter });
+            reporter.status(
+                "Starting",
+                &format!(
+                    "{} tests across {slots} slots, keeping {} free per host ({skipped} skipped)",
+                    cases.len(),
+                    format_size(profile.memory_reserve)
+                ),
+            );
+            let ctx = Arc::new(Ctx {
+                fixtures,
+                keep_fixtures: args.keep_fixtures,
+                memory_reserve: profile.memory_reserve,
+                reporter,
+                measured: Default::default(),
+            });
             tokio::select! {
                 _ = runner::run_all(ctx.clone(), &hosts, cases) => {}
                 _ = tokio::signal::ctrl_c() => {
@@ -215,6 +253,10 @@ fn run(args: Args) -> Result<ExitCode> {
                 }
             }
             let ok = ctx.reporter.summary(skipped);
+            let measured = std::mem::take(&mut *ctx.measured.lock().unwrap());
+            if let Err(e) = history.save(measured) {
+                ctx.reporter.warn(&format!("could not save memory history: {e:#}"));
+            }
             Ok(Some(ExitCode::from(if ok { 0 } else { 100 })))
         }
         .await;
@@ -332,6 +374,22 @@ fn fixture_defs(cfg: &Config, ws_root: &std::path::Path, files: &files::FileSet)
                 };
                 FixtureSpec::Docker(DockerSpec { image, env: f.env.clone(), ports, ready, export: f.export.clone() })
             }
+            FixtureKind::K3d => FixtureSpec::K3d(K3dSpec {
+                servers: f.servers.unwrap_or(1),
+                agents: f.agents.unwrap_or(0),
+                image: f.image.clone(),
+                args: f.args.clone(),
+                timeout: f.timeout.as_deref().map(config::parse_duration).transpose()?.unwrap_or(Duration::from_secs(300)),
+                ready: match &f.ready {
+                    None => None,
+                    Some(r) => Some(Ready {
+                        tcp: None,
+                        cmd: r.cmd.clone().map(|c| c.into_argv()),
+                        timeout: r.timeout.as_deref().map(config::parse_duration).transpose()?.unwrap_or(Duration::from_secs(120)),
+                    }),
+                },
+                export: f.export.clone(),
+            }),
             FixtureKind::Command => FixtureSpec::Command(CommandSpec {
                 setup: f.setup.clone().unwrap(),
                 teardown: f.teardown.clone(),

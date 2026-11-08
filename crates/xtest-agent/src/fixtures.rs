@@ -10,11 +10,18 @@ use serde::Deserialize;
 use tokio::process::Command;
 use xtest_proto::*;
 
-use crate::session::{Lease, LeaseKind, Session};
+use crate::memory;
+use crate::session::{Container, Lease, LeaseKind, Session};
 
-pub async fn setup(s: &Session, id: u64, name: &str, role: Role, spec: FixtureSpec) -> Result<Reply> {
+pub async fn setup(s: &Session, id: u64, name: &str, role: Role, spec: FixtureSpec, exclusive: bool) -> Result<Reply> {
     let (lease, debug_hint) = match spec {
-        FixtureSpec::Docker(d) => docker_setup(s, id, name, role, d).await?,
+        FixtureSpec::Docker(d) => docker_setup(s, id, name, role, d, exclusive).await?,
+        FixtureSpec::K3d(k) => {
+            if role == Role::Environment {
+                bail!("k3d fixtures can only be services (`uses`), not environments (`run-in`)");
+            }
+            k3d_setup(s, id, name, k).await?
+        }
         FixtureSpec::Command(c) => {
             if role == Role::Environment {
                 bail!("command fixtures can only be services (`uses`), not environments (`run-in`)");
@@ -32,9 +39,15 @@ pub async fn teardown(s: &Session, lease: Lease) {
         LeaseKind::Container(name) => {
             let _ = docker(["rm", "-f", &name]).await;
         }
+        LeaseKind::K3d(cluster) => {
+            if let Err(e) = tool("k3d", ["cluster", "delete", &cluster]).await {
+                eprintln!("xtest-agent: deleting k3d cluster {cluster}: {e:#}");
+            }
+        }
         LeaseKind::Command { teardown: Some(cmd), cwd } => {
             let args = ["-c".to_string(), cmd];
-            let out = s.build_command(Path::new("sh"), &args, &cwd, &BTreeMap::new(), None).output().await;
+            let cmd = s.build_command(Path::new("sh"), &args, &cwd, &BTreeMap::new(), None);
+            let out = Command::from(cmd).output().await;
             match out {
                 Ok(o) if o.status.success() => {}
                 Ok(o) => eprintln!("xtest-agent: fixture teardown failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
@@ -50,15 +63,119 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
+    tool("docker", args).await
+}
+
+/// Runs a host tool and returns its stdout, or an error with the end of its output.
+async fn tool<I, S>(program: &str, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     let args: Vec<_> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-    let out = Command::new("docker").args(&args).stdin(Stdio::null()).output().await?;
+    let out = Command::new(program)
+        .args(&args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("running {program} (is it installed on this host?)"))?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let tail: Vec<&str> = stderr.lines().rev().take(30).collect();
-        let tail: Vec<&str> = tail.into_iter().rev().collect();
-        bail!("docker {} failed:\n{}", args[0].to_string_lossy(), tail.join("\n"));
+        let sub = args.first().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();
+        bail!("{program} {sub} failed:\n{}", tail(&out.stdout, &out.stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The last lines of a command's output, for error messages.
+fn tail(stdout: &[u8], stderr: &[u8]) -> String {
+    let text = format!("{}{}", String::from_utf8_lossy(stdout), String::from_utf8_lossy(stderr));
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(30)..].join("\n")
+}
+
+/// Name of the k3d cluster for a lease. Contains the run id so leftover
+/// clusters can be matched to their run; short enough for k3d's name limit.
+pub fn k3d_cluster_name(run_id: &str, lease: u64) -> String {
+    format!("xt{lease}-{run_id}")
+}
+
+async fn k3d_setup(s: &Session, id: u64, fixture: &str, k: K3dSpec) -> Result<(Lease, Option<String>)> {
+    if !s.docker {
+        bail!("fixture `{fixture}` needs docker for k3d, which is not available on this host");
+    }
+    let cluster = k3d_cluster_name(&s.run_id, id);
+    let kubeconfig = s.run_dir.join("tmp").join(format!("kubeconfig-{id}.yaml"));
+    let fill = |t: &str| t.replace("{cluster}", &cluster).replace("{kubeconfig}", &kubeconfig.display().to_string());
+
+    let mut args: Vec<String> = vec![
+        "cluster".into(),
+        "create".into(),
+        cluster.clone(),
+        "--wait".into(),
+        "--timeout".into(),
+        format!("{}s", k.timeout.as_secs().max(1)),
+        "--kubeconfig-update-default=false".into(),
+        "--kubeconfig-switch-context=false".into(),
+        "--servers".into(),
+        k.servers.max(1).to_string(),
+        "--agents".into(),
+        k.agents.to_string(),
+    ];
+    if let Some(image) = &k.image {
+        args.extend(["--image".into(), image.clone()]);
+    }
+    // Labels on the server nodes let the agent find leftover clusters later.
+    for label in [format!("xtest.run={}", s.run_id), format!("xtest.root={}", s.root.display())] {
+        args.extend(["--runtime-label".into(), format!("{label}@server:*")]);
+    }
+    args.extend(k.args.iter().cloned());
+
+    let created = tool("k3d", &args).await.context("creating k3d cluster");
+    let ready = async {
+        created?;
+        let config = tool("k3d", ["kubeconfig", "get", &cluster]).await?;
+        std::fs::write(&kubeconfig, config)?;
+        let mut env = BTreeMap::from([("KUBECONFIG".to_string(), kubeconfig.display().to_string())]);
+        if let Some(r) = &k.ready {
+            let cmd: Vec<String> = r.cmd.iter().flatten().map(|a| fill(a)).collect();
+            wait_for_command(s, &cmd, &env, r.timeout).await?;
+        }
+        env.extend(k.export.iter().map(|(name, v)| (name.clone(), fill(v))));
+        anyhow::Ok(env)
+    }
+    .await;
+    match ready {
+        Ok(env) => {
+            let hint = format!("KUBECONFIG={} kubectl get pods -A", kubeconfig.display());
+            Ok((Lease { kind: LeaseKind::K3d(cluster), env, container: None }, Some(hint)))
+        }
+        Err(e) => {
+            let _ = tool("k3d", ["cluster", "delete", &cluster]).await;
+            Err(e)
+        }
+    }
+}
+
+/// Runs `cmd` on the host (with the sandbox's paths) until it exits 0.
+async fn wait_for_command(
+    s: &Session,
+    cmd: &[String],
+    env: &BTreeMap<String, String>,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let Some((exe, args)) = cmd.split_first() else { return Ok(()) };
+    let cwd = s.mirrors().into_iter().next().unwrap_or_else(|| "/".into());
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = Command::from(s.build_command(Path::new(exe), args, &cwd, env, None)).output().await?;
+        if out.status.success() {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!("not ready after {timeout:?}; `{}` said:\n{}", cmd.join(" "), tail(&out.stdout, &out.stderr));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 async fn docker_setup(
@@ -67,6 +184,7 @@ async fn docker_setup(
     fixture: &str,
     role: Role,
     d: DockerSpec,
+    exclusive: bool,
 ) -> Result<(Lease, Option<String>)> {
     if !s.docker {
         bail!("fixture `{fixture}` needs docker, which is not available on this host");
@@ -79,7 +197,7 @@ async fn docker_setup(
                 let ctx = s.host_path(context);
                 docker(["build".as_ref(), "-t".as_ref(), tag.as_ref(), "-f".as_ref(), df.as_os_str(), ctx.as_os_str()])
                     .await
-                    .with_context(|| format!("building image for fixture `{fixture}`"))?;
+                    .context("building image")?;
             }
             tag.clone()
         }
@@ -128,7 +246,7 @@ async fn docker_setup(
             args.push(image);
         }
     }
-    docker(&args).await.with_context(|| format!("starting fixture `{fixture}`"))?;
+    docker(&args).await.context("starting container")?;
 
     let started = async {
         let mut mapped = BTreeMap::new();
@@ -152,11 +270,16 @@ async fn docker_setup(
         Ok(env) => env,
         Err(e) => {
             let _ = docker(["rm", "-f", &name]).await;
-            return Err(e.context(format!("fixture `{fixture}`")));
+            return Err(e);
         }
     };
     let (container, hint) = match role {
-        Role::Environment => (Some(name.clone()), format!("docker exec -it {name} sh")),
+        Role::Environment => {
+            let pid = docker(["inspect", "-f", "{{.State.Pid}}", &name]).await?;
+            let cgroup = pid.trim().parse().ok().and_then(memory::cgroup_of);
+            let c = Container { name: name.clone(), cgroup, exclusive };
+            (Some(c), format!("docker exec -it {name} sh"))
+        }
         Role::Service => (None, format!("docker logs {name}")),
     };
     Ok((Lease { kind: LeaseKind::Container(name), env, container }, Some(hint)))
@@ -211,7 +334,8 @@ async fn command_setup(s: &Session, c: CommandSpec) -> Result<Lease> {
         env: BTreeMap<String, String>,
     }
     let args = ["-c".to_string(), c.setup.clone()];
-    let out = s.build_command(Path::new("sh"), &args, &c.cwd, &BTreeMap::new(), None).output().await?;
+    let cmd = s.build_command(Path::new("sh"), &args, &c.cwd, &BTreeMap::new(), None);
+    let out = Command::from(cmd).output().await?;
     if !out.status.success() {
         bail!("setup command `{}` failed:\n{}", c.setup, String::from_utf8_lossy(&out.stderr).trim());
     }

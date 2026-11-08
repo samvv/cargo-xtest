@@ -18,7 +18,14 @@ use crate::config::Host;
 pub enum ProcEvent {
     #[allow(dead_code)] // the stream is not shown separately yet
     Output(Stream, Vec<u8>),
-    Exited(Exit, Duration),
+    Exited(Exit, Duration, Option<u64>),
+}
+
+pub struct RunResult {
+    pub exit: Exit,
+    pub output: Vec<u8>,
+    pub duration: Duration,
+    pub peak_memory: Option<u64>,
 }
 
 #[derive(Default)]
@@ -116,9 +123,9 @@ impl Agent {
                             let _ = tx.send(ProcEvent::Output(stream, data));
                         }
                     }
-                    AgentMsg::Exited { req, status, duration } => {
+                    AgentMsg::Exited { req, status, duration, peak_memory } => {
                         if let Some(tx) = r.procs.remove(&req) {
-                            let _ = tx.send(ProcEvent::Exited(status, duration));
+                            let _ = tx.send(ProcEvent::Exited(status, duration, peak_memory));
                         }
                     }
                 }
@@ -185,16 +192,31 @@ impl Agent {
     }
 
     /// Runs a process to completion and returns its exit and combined output.
-    pub async fn run(&self, spec: SpawnSpec) -> Result<(Exit, Vec<u8>, Duration)> {
-        let (_, mut rx) = self.spawn(spec);
-        let mut out = Vec::new();
+    pub async fn run(&self, spec: SpawnSpec) -> Result<RunResult> {
+        self.run_tracked(spec, |_| {}).await
+    }
+
+    /// Like `run`, and tells `started` the request id the agent knows the process by.
+    pub async fn run_tracked(&self, spec: SpawnSpec, started: impl FnOnce(u64)) -> Result<RunResult> {
+        let (req, mut rx) = self.spawn(spec);
+        started(req);
+        let mut output = Vec::new();
         while let Some(ev) = rx.recv().await {
             match ev {
-                ProcEvent::Output(_, data) => out.extend(data),
-                ProcEvent::Exited(exit, d) => return Ok((exit, out, d)),
+                ProcEvent::Output(_, data) => output.extend(data),
+                ProcEvent::Exited(exit, duration, peak_memory) => {
+                    return Ok(RunResult { exit, output, duration, peak_memory })
+                }
             }
         }
         bail!("connection to `{}` lost", self.name)
+    }
+
+    pub async fn memory(&self) -> Result<MemoryInfo> {
+        match self.request(Request::Memory).await? {
+            Reply::Memory(m) => Ok(m),
+            other => bail!("unexpected reply to Memory: {other:?}"),
+        }
     }
 
     pub async fn shutdown(&self, keep: Vec<u64>) -> Result<()> {
@@ -208,13 +230,17 @@ impl Agent {
     }
 }
 
+/// Runs a POSIX shell script on the host. The script goes through `sh -c`
+/// because the user's login shell may be anything (fish, nu, ...).
 fn ssh(host: &Host, dest: &str, script: &str) -> Command {
+    // Inside single quotes, fish still treats `\\` and `\'` as escapes.
+    debug_assert!(!script.contains('\\'), "remote scripts must not contain backslashes");
     let program = host
         .ssh_program
         .clone()
         .unwrap_or_else(|| vec!["ssh".into(), "-o".into(), "BatchMode=yes".into()]);
     let mut c = Command::new(&program[0]);
-    c.args(&program[1..]).arg(dest).arg(script);
+    c.args(&program[1..]).arg(dest).arg(format!("sh -c {}", sh_quote(script)));
     c
 }
 

@@ -16,34 +16,35 @@ pub fn try_lock(path: &Path) -> Option<File> {
 
 pub fn collect(root: &Path, docker: bool) {
     let runs = root.join("runs");
-    let Ok(entries) = fs::read_dir(&runs) else { return };
-    for e in entries.filter_map(|e| e.ok()) {
-        let dir = e.path();
-        let id = e.file_name().to_string_lossy().into_owned();
-        if dir.join("keep").exists() {
-            continue;
-        }
-        let lock = dir.join("lock");
-        let stale = if lock.exists() {
-            try_lock(&lock).is_some()
-        } else {
-            // A brand-new run creates its lock right after its directory.
-            e.metadata()
-                .and_then(|m| m.modified())
-                .map(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(60))
-                .unwrap_or(false)
-        };
-        if stale {
-            if docker {
-                remove_containers(&format!("label=xtest.run={id}"));
+    let mut stale = Vec::new();
+    if let Ok(entries) = fs::read_dir(&runs) {
+        for e in entries.filter_map(|e| e.ok()) {
+            let dir = e.path();
+            if dir.join("keep").exists() {
+                continue;
             }
-            if let Err(err) = remove_tree(&dir) {
-                eprintln!("xtest-agent: could not remove stale run {}: {err}", dir.display());
+            let lock = dir.join("lock");
+            let is_stale = if lock.exists() {
+                try_lock(&lock).is_some()
+            } else {
+                // A brand-new run creates its lock right after its directory.
+                e.metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(60))
+                    .unwrap_or(false)
+            };
+            if is_stale {
+                stale.push((e.file_name().to_string_lossy().into_owned(), dir));
             }
         }
     }
+    // A run is dead if it is stale or its directory is gone altogether.
+    let dead = |run: &str| stale.iter().any(|(id, _)| id == run) || !runs.join(run).exists();
+
     if docker {
-        // Containers whose run directory is gone entirely.
+        // k3d first: deleting a cluster properly also removes its network
+        // and volumes, which force-removing its containers would leave behind.
+        collect_k3d(root, &dead);
         let out = Command::new("docker")
             .args(["ps", "-a", "--filter"])
             .arg(format!("label=xtest.root={}", root.display()))
@@ -52,11 +53,41 @@ pub fn collect(root: &Path, docker: bool) {
         if let Ok(out) = out {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 if let Some((name, run)) = line.split_once(' ') {
-                    if !runs.join(run).exists() {
+                    if dead(run) {
                         let _ = Command::new("docker").args(["rm", "-f", name]).output();
                     }
                 }
             }
+        }
+        for (id, _) in &stale {
+            remove_containers(&format!("label=xtest.run={id}"));
+        }
+    }
+    for (_, dir) in stale {
+        if let Err(err) = remove_tree(&dir) {
+            eprintln!("xtest-agent: could not remove stale run {}: {err}", dir.display());
+        }
+    }
+}
+
+fn collect_k3d(root: &Path, dead: &dyn Fn(&str) -> bool) {
+    let out = Command::new("docker")
+        .args(["ps", "-a", "--filter", "label=app=k3d", "--filter"])
+        .arg(format!("label=xtest.root={}", root.display()))
+        .args(["--format", "{{.Label \"k3d.cluster\"}} {{.Label \"xtest.run\"}}"])
+        .output();
+    let Ok(out) = out else { return };
+    let mut clusters: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(_, run)| dead(run))
+        .map(|(cluster, _)| cluster.to_string())
+        .collect();
+    clusters.sort();
+    clusters.dedup();
+    for c in clusters {
+        if Command::new("k3d").args(["cluster", "delete", &c]).output().is_err() {
+            eprintln!("xtest-agent: k3d cluster {c} is left over, but k3d is not installed");
         }
     }
 }

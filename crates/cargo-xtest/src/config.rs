@@ -26,6 +26,10 @@ pub struct Profile {
     pub target: Option<String>,
     pub include: Option<Vec<String>>,
     pub timeout: Option<String>,
+    /// Memory assumed for a test that has not been measured yet.
+    pub memory: Option<String>,
+    /// Memory kept free on every host; tests only start while this much remains.
+    pub memory_reserve: Option<String>,
     #[serde(default)]
     pub overrides: Vec<Override>,
 }
@@ -39,6 +43,8 @@ pub struct Override {
     pub uses: Vec<String>,
     pub include_ignored: Option<bool>,
     pub timeout: Option<String>,
+    /// Memory this test needs; wins over the measured peak.
+    pub memory: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
@@ -55,6 +61,7 @@ pub enum Scope {
 pub enum FixtureKind {
     Docker,
     Command,
+    K3d,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +83,34 @@ pub struct Fixture {
     // command
     pub setup: Option<String>,
     pub teardown: Option<String>,
+    // k3d
+    pub servers: Option<u32>,
+    pub agents: Option<u32>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// How long cluster creation may take.
+    pub timeout: Option<String>,
+}
+
+impl Fixture {
+    /// Names of the fields that are set, for checking they fit the kind.
+    fn set_fields(&self) -> Vec<&'static str> {
+        let mut f = Vec::new();
+        let mut add = |set: bool, name| if set { f.push(name) };
+        add(self.image.is_some(), "image");
+        add(self.build.is_some(), "build");
+        add(!self.env.is_empty(), "env");
+        add(!self.ports.is_empty(), "ports");
+        add(self.ready.is_some(), "ready");
+        add(!self.export.is_empty(), "export");
+        add(self.setup.is_some(), "setup");
+        add(self.teardown.is_some(), "teardown");
+        add(self.servers.is_some(), "servers");
+        add(self.agents.is_some(), "agents");
+        add(!self.args.is_empty(), "args");
+        add(self.timeout.is_some(), "timeout");
+        f
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,8 +163,13 @@ pub struct Resolved {
     pub target: Option<String>,
     pub include: Vec<String>,
     pub timeout: Option<Duration>,
+    pub memory: u64,
+    pub memory_reserve: u64,
     pub overrides: Vec<(Filter, Override)>,
 }
+
+pub const DEFAULT_MEMORY: u64 = 256 << 20;
+pub const DEFAULT_MEMORY_RESERVE: u64 = 512 << 20;
 
 impl Config {
     pub fn load(workspace_root: &Path, explicit: Option<&Path>) -> Result<Config> {
@@ -148,6 +188,19 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         for (name, f) in &self.fixture {
+            let allowed: &[&str] = match f.kind {
+                FixtureKind::Docker => &["image", "build", "env", "ports", "ready", "export"],
+                FixtureKind::Command => &["setup", "teardown"],
+                FixtureKind::K3d => &["image", "servers", "agents", "args", "timeout", "ready", "export"],
+            };
+            if let Some(bad) = f.set_fields().into_iter().find(|x| !allowed.contains(x)) {
+                bail!("fixture `{name}`: `{bad}` is not supported by {:?} fixtures", f.kind);
+            }
+            if let (FixtureKind::K3d, Some(r)) = (f.kind, &f.ready) {
+                if r.tcp.is_some() {
+                    bail!("fixture `{name}`: k3d fixtures support `ready.cmd`, not `ready.tcp`");
+                }
+            }
             match f.kind {
                 FixtureKind::Docker => {
                     if f.image.is_some() == f.build.is_some() {
@@ -159,6 +212,7 @@ impl Config {
                         bail!("fixture `{name}`: command fixtures need `setup`");
                     }
                 }
+                FixtureKind::K3d => {}
             }
         }
         for (pname, p) in &self.profile {
@@ -186,6 +240,8 @@ impl Config {
             _ => self.profile.get(name).cloned().with_context(|| format!("no profile `{name}`"))?,
         };
         let timeout = p.timeout.clone().or(default.timeout.clone());
+        let memory = p.memory.clone().or(default.memory.clone());
+        let reserve = p.memory_reserve.clone().or(default.memory_reserve.clone());
         let mut overrides = Vec::new();
         let chain = if name == "default" { vec![&p] } else { vec![&default, &p] };
         for prof in chain {
@@ -198,6 +254,8 @@ impl Config {
             target: p.target.clone().or(default.target.clone()),
             include: p.include.clone().or(default.include.clone()).unwrap_or_default(),
             timeout: timeout.as_deref().map(parse_duration).transpose()?,
+            memory: memory.as_deref().map(parse_size).transpose()?.unwrap_or(DEFAULT_MEMORY),
+            memory_reserve: reserve.as_deref().map(parse_size).transpose()?.unwrap_or(DEFAULT_MEMORY_RESERVE),
             overrides,
         })
     }
@@ -219,9 +277,57 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
     Ok(Duration::from_secs_f64(secs))
 }
 
+/// Parses `512M`, `4G`, `1.5GiB`, `100KB`, or a bare number of bytes.
+/// Units are binary: `M`, `MB` and `MiB` all mean 1024² bytes.
+pub fn parse_size(s: &str) -> Result<u64> {
+    let t = s.trim();
+    let split = t.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let n: f64 = num.parse().with_context(|| format!("bad size `{s}`"))?;
+    let unit = unit.trim().to_ascii_uppercase();
+    let shift = match unit.trim_end_matches("IB").trim_end_matches('B') {
+        "" => 0,
+        "K" => 10,
+        "M" => 20,
+        "G" => 30,
+        "T" => 40,
+        _ => bail!("bad size unit in `{s}`"),
+    };
+    Ok((n * (1u64 << shift) as f64) as u64)
+}
+
+pub fn format_size(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= (1u64 << 30) as f64 {
+        format!("{:.1} GiB", b / (1u64 << 30) as f64)
+    } else {
+        format!("{:.1} MiB", b / (1u64 << 20) as f64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes() {
+        assert_eq!(parse_size("512M").unwrap(), 512 << 20);
+        assert_eq!(parse_size("4G").unwrap(), 4 << 30);
+        assert_eq!(parse_size("1.5GiB").unwrap(), 3 << 29);
+        assert_eq!(parse_size("100kb").unwrap(), 100 << 10);
+        assert_eq!(parse_size("1000").unwrap(), 1000);
+        assert!(parse_size("5 bananas").is_err());
+        assert_eq!(format_size(3 << 29), "1.5 GiB");
+    }
+
+    #[test]
+    fn rejects_fields_of_other_kinds() {
+        let cfg: Config = toml::from_str("[fixture.x]\nkind = \"k3d\"\nsetup = \"true\"\n").unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("`setup` is not supported"), "{err}");
+        let cfg: Config = toml::from_str("[fixture.x]\nkind = \"docker\"\nimage = \"a\"\nagents = 2\n").unwrap();
+        assert!(cfg.validate().is_err());
+    }
 
     #[test]
     fn durations() {
@@ -257,6 +363,13 @@ mod tests {
             env = { POSTGRES_PASSWORD = "x" }
             ready = { cmd = ["pg_isready", "-U", "postgres"], timeout = "30s" }
             export = { DATABASE_URL = "postgres://postgres:x@{host}:{port:5432}/postgres" }
+
+            [fixture.k8s]
+            kind = "k3d"
+            scope = "run"
+            agents = 1
+            args = ["--no-lb"]
+            ready = { cmd = "docker exec k3d-{cluster}-server-0 kubectl wait --for=condition=Ready nodes --all" }
 
             [[host]]
             name = "pi4"

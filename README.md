@@ -23,7 +23,7 @@ cargo xtest                               # in any workspace
    the agent cleans up anyway; leftovers from a crashed agent are removed
    on its next start.
 
-Hosts only need SSH. The agent installs itself on first use under
+Hosts only need SSH (any login shell; commands run through `sh -c`). The agent installs itself on first use under
 `$XDG_CACHE_HOME/cargo-xtest` (default `~/.cache/cargo-xtest`).
 
 ## Configuration: `.config/xtest.toml`
@@ -33,12 +33,15 @@ Hosts only need SSH. The agent installs itself on first use under
 target = "x86_64-unknown-linux-musl"   # optional
 include = ["tests/data/**"]            # extra files, even if gitignored
 timeout = "60s"
+memory = "256M"                        # assumed for tests not measured yet
+memory-reserve = "512M"                # kept free on every host
 
 [[profile.default.overrides]]
 filter = "package(myapp) & test(=backup::tests::creates_archive)"
 run-in = "borg"            # environment: the test runs inside it
 uses = ["pg"]              # services: run next to the test
 include-ignored = true
+memory = "2G"              # wins over the measured peak
 
 [fixture.borg]
 kind = "docker"
@@ -52,6 +55,17 @@ scope = "run"
 env = { POSTGRES_PASSWORD = "x" }
 ready = { cmd = ["pg_isready", "-U", "postgres"], timeout = "30s" }
 export = { DATABASE_URL = "postgres://postgres:x@{host}:{port:5432}/postgres" }
+
+[fixture.k8s]
+kind = "k3d"                         # k3d cluster create / k3d cluster delete
+scope = "run"
+servers = 1                          # default 1
+agents = 1                           # default 0
+# image = "rancher/k3s:v1.31.4-k3s1"
+args = ["--no-lb"]                   # extra `k3d cluster create` arguments
+timeout = "5m"                       # for cluster creation (default 300s)
+ready = { cmd = "docker exec k3d-{cluster}-server-0 kubectl wait --for=condition=Ready nodes --all", timeout = "3m" }
+export = { K3D_CLUSTER = "{cluster}" }
 
 [fixture.tmpstate]
 kind = "command"
@@ -72,10 +86,42 @@ Without any `[[host]]`, tests run on this machine.
 Matchers: `=exact`, `~substring`, `/regex/`. Plain `test(x)` matches a
 substring; plain values for the other predicates match exactly.
 
+**k3d fixtures** are services only (`uses`). Tests get `KUBECONFIG` pointing
+to the cluster's kubeconfig; `{cluster}` and `{kubeconfig}` can be used in
+`export` and `ready.cmd`, which runs on the host until it succeeds. The host
+needs `k3d` and docker. Clusters are named `xt<lease>-<run id>` and labeled,
+so the agent deletes leftover clusters properly on its next start.
+
 **Environment containers** run as your uid, with `--network host`, the
 sandbox mounted at its original paths, and `sleep infinity` as entrypoint.
 The test binary is built on your machine, so the image needs a glibc at
 least as new as yours, or build for a musl target.
+
+## Memory scheduling
+
+Besides its slots, each host only starts a test while there is room for it.
+Before starting one, the controller asks the agent for `MemAvailable` and
+for what each running test uses right now. It then computes
+
+```
+free = MemAvailable − Σ(estimate − current use of each running test) − memory-reserve
+```
+
+and starts the biggest queued test that fits. A host with nothing running
+always starts the next test, so a test bigger than any host still runs (with
+a warning).
+
+A test's estimate is, in order: `memory` from a matching override, the peak
+measured in the last run (`<target>/xtest/memory.json`), or the profile's
+`memory`. Peaks are measured as:
+
+- plain processes: max RSS from `wait4` (the largest single process of the test);
+- in a container of its own (`scope = "test"`): the container cgroup's `memory.peak`;
+- in a shared container: the sampled RSS of processes tagged with the test's
+  `XTEST_REQ` env var.
+
+The report shows each test's measured peak; `--list` shows the estimate and
+where it came from.
 
 ## CLI
 
