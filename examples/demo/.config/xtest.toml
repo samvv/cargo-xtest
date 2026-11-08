@@ -1,0 +1,33 @@
+[profile.default]
+timeout = "60s"
+
+[[profile.default.overrides]]
+filter = "binary(greeting)"
+uses = ["greeter"]
+include-ignored = true
+
+[[profile.default.overrides]]
+filter = "binary(redis)"
+uses = ["redis"]
+include-ignored = true
+
+[[profile.default.overrides]]
+filter = "package(myapp) & test(=creates_archive)"
+run-in = "borg"
+include-ignored = true
+
+[fixture.greeter]
+kind = "command"
+setup = "./scripts/greeter-up.sh"
+teardown = "rm -f {handle}"
+
+[fixture.redis]
+kind = "docker"
+image = "redis:7-alpine"
+scope = "run"
+ready = { cmd = ["redis-cli", "ping"], timeout = "30s" }
+export = { REDIS_ADDR = "{host}:{port:6379}" }
+
+[fixture.borg]
+kind = "docker"
+build = { dockerfile = "tests/docker/borg.Dockerfile", context = "tests/docker" }

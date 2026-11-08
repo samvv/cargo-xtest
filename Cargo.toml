@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/xtest-proto", "crates/xtest-agent", "crates/cargo-xtest"]
+exclude = ["examples"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+xtest-proto = { path = "crates/xtest-proto" }
+xtest-agent = { path = "crates/xtest-agent" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["use-std"] }
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
+sha2 = "0.10"
+hex = "0.4"
