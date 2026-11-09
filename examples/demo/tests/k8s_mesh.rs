@@ -35,9 +35,15 @@ fn cluster_b_reaches_a_nodeport() {
 
     let url = format!("http://{}:30080/", var("A_SERVER_IP"));
     let probe = format!("for i in $(seq 30); do wget -qO- -T 3 {url} && exit 0; sleep 2; done; exit 1");
-    let out = kubectl(&b, &[
-        "run", "probe", "--image=busybox:1.36", "--restart=Never", "--rm", "-i",
-        "--pod-running-timeout=3m", "--command", "--", "sh", "-c", &probe,
-    ]);
+    // Wait for the pod and read its logs: attaching (`kubectl run -i`) can
+    // miss the output of a pod that finishes quickly.
+    kubectl(&b, &["delete", "pod", "probe", "--ignore-not-found"]);
+    kubectl(&b, &["run", "probe", "--image=busybox:1.36", "--restart=Never", "--command", "--", "sh", "-c", &probe]);
+    let done = Command::new("kubectl")
+        .args(["--context", &b, "wait", "pod/probe", "--for=jsonpath={.status.phase}=Succeeded", "--timeout=180s"])
+        .status()
+        .unwrap();
+    let out = kubectl(&b, &["logs", "probe"]);
+    assert!(done.success(), "probe pod did not succeed; logs:\n{out}");
     assert!(out.contains("hello-from-a"), "{out}");
 }
