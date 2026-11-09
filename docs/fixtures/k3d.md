@@ -33,7 +33,7 @@ uses = ["k8s"]
 | `runner` | none | `{ image = "..." }` or `{ build = { dockerfile = "...", context = "..." } }`: the container tests run in with `run-in` |
 | `network` | none | share a Docker network with other clusters; see [Networking between clusters](#networking-between-clusters) |
 
-Plus `kind` and `scope`, which every fixture has; see
+Plus `kind`, `scope` and `memory`, which every fixture has; see
 [configuration](../configuration.md#fixtures-fixturename). Clusters are slow to
 create, so `scope = "run"` is usually best.
 

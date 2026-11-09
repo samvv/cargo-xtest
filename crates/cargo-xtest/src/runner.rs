@@ -20,6 +20,26 @@ use crate::files::FileSet;
 pub struct FixtureDef {
     pub scope: Scope,
     pub spec: FixtureSpec,
+    /// Estimated memory of the fixture itself, in bytes.
+    pub memory: u64,
+    pub memory_source: MemorySource,
+}
+
+impl FixtureDef {
+    /// Memory to set aside for one instance in this role. A Docker
+    /// environment holds only the tests that run in it, which are charged
+    /// for themselves.
+    pub fn charge(&self, role: Role) -> u64 {
+        match (&self.spec, role) {
+            (FixtureSpec::Docker(_), Role::Environment) => 0,
+            _ => self.memory,
+        }
+    }
+}
+
+/// History key of a fixture's measured peak.
+pub fn fixture_history_key(name: &str) -> String {
+    format!("fixture:{name}")
 }
 
 /// One test to run.
@@ -56,13 +76,25 @@ impl Case {
     }
 }
 
+/// A fixture instance: (fixture, is environment, scope key). The scope key is
+/// empty for `run` scope, the binary for `binary` scope, and unique per test
+/// for `test` scope.
 type LeaseKey = (String, bool, String);
 type SharedLease = Arc<OnceCell<Result<(u64, Option<String>), String>>>;
+
+/// Memory set aside on a host for a fixture instance, from when the first
+/// test that needs it starts until the instance is torn down.
+struct Reservation {
+    memory: u64,
+    /// The agent's lease id, once set up; its measured use counts against `memory`.
+    lease: Option<u64>,
+}
 
 pub struct HostState {
     pub agent: Agent,
     pub slots: usize,
     leases: tokio::sync::Mutex<HashMap<LeaseKey, SharedLease>>,
+    reservations: Mutex<HashMap<LeaseKey, Reservation>>,
     next_lease: AtomicU64,
     /// Leases kept for debugging, with a message for the user.
     pub kept: Mutex<Vec<(u64, String)>>,
@@ -74,6 +106,7 @@ impl HostState {
             agent,
             slots,
             leases: Default::default(),
+            reservations: Default::default(),
             next_lease: AtomicU64::new(1),
             kept: Default::default(),
         }
@@ -90,25 +123,68 @@ impl HostState {
     }
 
     /// Returns the lease id, and its debug hint if the lease belongs to this test only.
-    async fn lease(&self, ctx: &Ctx, name: &str, role: Role, case: &Case) -> Result<(u64, Option<Option<String>>)> {
+    async fn lease(&self, ctx: &Ctx, name: &str, role: Role, case: &Case, slot: usize) -> Result<(u64, Option<Option<String>>)> {
         let def = &ctx.fixtures[name];
-        let scope_key = match def.scope {
-            Scope::Test => {
-                let (id, hint) = self.setup(def, name, role).await?;
-                return Ok((id, Some(hint)));
+        let key = lease_key(def, name, role, case, slot);
+        let res = if def.scope == Scope::Test {
+            self.setup(def, name, role).await.map(|(id, hint)| (id, Some(hint)))
+        } else {
+            let cell = self.leases.lock().await.entry(key.clone()).or_default().clone();
+            let res = cell
+                .get_or_init(|| async { self.setup(def, name, role).await.map_err(|e| format!("{e:#}")) })
+                .await;
+            match res {
+                Ok((id, _)) => Ok((*id, None)),
+                Err(e) => Err(anyhow::anyhow!("{e}")),
             }
-            Scope::Binary => case.bin.exe.display().to_string(),
-            Scope::Run => String::new(),
         };
-        let key = (name.to_string(), role == Role::Environment, scope_key);
-        let cell = self.leases.lock().await.entry(key).or_default().clone();
-        let res = cell
-            .get_or_init(|| async { self.setup(def, name, role).await.map_err(|e| format!("{e:#}")) })
-            .await;
-        match res {
-            Ok((id, _)) => Ok((*id, None)),
-            Err(e) => bail!("{e}"),
+        let mut reservations = self.reservations.lock().unwrap();
+        match &res {
+            Ok((id, _)) => {
+                if let Some(r) = reservations.get_mut(&key) {
+                    r.lease = Some(*id);
+                }
+            }
+            // Nothing runs, so nothing to set aside.
+            Err(_) => {
+                reservations.remove(&key);
+            }
         }
+        res
+    }
+
+    /// Fixture instances `case` needs that have no memory set aside on this
+    /// host yet, with the memory they need.
+    fn unreserved(&self, ctx: &Ctx, case: &Case, slot: usize) -> Vec<(LeaseKey, u64)> {
+        let reservations = self.reservations.lock().unwrap();
+        fixtures_of(case)
+            .filter_map(|(name, role)| {
+                let def = &ctx.fixtures[name];
+                let key = lease_key(def, name, role, case, slot);
+                (!reservations.contains_key(&key)).then(|| (key, def.charge(role)))
+            })
+            .collect()
+    }
+
+    /// Memory that fixtures are still expected to take on top of what they use now.
+    fn fixtures_owed(&self, mem: &MemoryInfo) -> u64 {
+        self.reservations
+            .lock()
+            .unwrap()
+            .values()
+            .map(|r| r.memory.saturating_sub(r.lease.and_then(|l| mem.fixtures.get(&l)).map_or(0, |u| u.current)))
+            .sum()
+    }
+
+    /// Peaks of the fixture instances still alive, by fixture name.
+    pub async fn fixture_peaks(&self) -> Vec<(String, u64)> {
+        let Ok(mem) = self.agent.memory().await else { return vec![] };
+        let reservations = self.reservations.lock().unwrap();
+        reservations
+            .iter()
+            .filter_map(|((name, _, _), r)| Some((name.clone(), mem.fixtures.get(&r.lease?)?.peak)))
+            .filter(|(_, peak)| *peak > 0)
+            .collect()
     }
 }
 
@@ -127,6 +203,13 @@ impl Ctx {
             self.measured.lock().unwrap().insert(case.display(), peak);
         }
         self.reporter.report(host, case, outcome);
+    }
+
+    /// Records a fixture instance's peak; the history keeps the largest of this run.
+    pub fn record_fixture(&self, name: &str, peak: u64) {
+        let mut measured = self.measured.lock().unwrap();
+        let e = measured.entry(fixture_history_key(name)).or_insert(0);
+        *e = (*e).max(peak);
     }
 }
 
@@ -203,6 +286,20 @@ pub async fn discover(agent: &Agent, bins: &[Arc<TestBinary>]) -> Result<Vec<(Ar
     Ok(out)
 }
 
+fn lease_key(def: &FixtureDef, name: &str, role: Role, case: &Case, slot: usize) -> LeaseKey {
+    let scope = match def.scope {
+        Scope::Test => format!("test#{slot}"),
+        Scope::Binary => case.bin.exe.display().to_string(),
+        Scope::Run => String::new(),
+    };
+    (name.to_string(), role == Role::Environment, scope)
+}
+
+/// The fixtures a test needs, with the role it uses each in.
+fn fixtures_of(case: &Case) -> impl Iterator<Item = (&String, Role)> {
+    case.run_in.iter().map(|n| (n, Role::Environment)).chain(case.uses.iter().map(|n| (n, Role::Service)))
+}
+
 pub async fn run_all(ctx: Arc<Ctx>, hosts: &[Arc<HostState>], mut cases: Vec<Case>) {
     // Biggest first: they are the hardest to fit once memory is shared out.
     // The sort is stable, so equal tests keep their discovery order.
@@ -224,10 +321,11 @@ struct Inflight {
 
 /// Starts tests on one host while it has a free slot and enough memory.
 ///
-/// Free memory is `MemAvailable` minus what running tests are still expected
-/// to take on top of what they use now (their estimate minus current usage),
-/// minus the reserve. A test that fits nowhere still runs once the host is
-/// idle, so nothing waits forever.
+/// Free memory is `MemAvailable` minus what running tests and fixtures are
+/// still expected to take on top of what they use now (their estimate minus
+/// current usage), minus the reserve. A test costs its own estimate plus that
+/// of each fixture instance it would create. A test that fits nowhere still
+/// runs once the host is idle, so nothing waits forever.
 async fn dispatch(ctx: Arc<Ctx>, host: Arc<HostState>, queue: Arc<Mutex<VecDeque<Case>>>) {
     let inflight: Arc<Mutex<HashMap<usize, Inflight>>> = Default::default();
     let mut running = JoinSet::new();
@@ -242,31 +340,40 @@ async fn dispatch(ctx: Arc<Ctx>, host: Arc<HostState>, queue: Arc<Mutex<VecDeque
                     .values()
                     .map(|f| f.memory.saturating_sub(f.req.and_then(|r| m.running.get(&r).copied()).unwrap_or(0)))
                     .sum();
+                let owed = owed + host.fixtures_owed(m);
                 m.available.saturating_sub(owed).saturating_sub(ctx.memory_reserve)
             });
+            let id = next_id;
+            let cost = |c: &Case| c.memory + host.unreserved(&ctx, c, id).iter().map(|(_, m)| m).sum::<u64>();
             let case = {
                 let mut q = queue.lock().unwrap();
                 let idx = match free {
                     // The agent is unreachable; the test will report that.
                     None => Some(0),
-                    Some(free) => q.iter().position(|c| c.memory <= free).or(running.is_empty().then_some(0)),
+                    Some(free) => q.iter().position(|c| cost(c) <= free).or(running.is_empty().then_some(0)),
                 };
                 idx.and_then(|i| q.remove(i))
             };
             let Some(case) = case else { break };
+            let new_fixtures = host.unreserved(&ctx, &case, id);
+            let total_cost = case.memory + new_fixtures.iter().map(|(_, m)| m).sum::<u64>();
             if let Some(m) = &mem {
-                if case.memory > m.total {
+                if total_cost > m.total {
                     ctx.reporter.warn(&format!(
-                        "{} needs {} but `{}` only has {} in total",
+                        "{} needs {} (with its fixtures) but `{}` only has {} in total",
                         case.display(),
-                        format_size(case.memory),
+                        format_size(total_cost),
                         host.agent.name,
                         format_size(m.total)
                     ));
                 }
             }
-
-            let id = next_id;
+            {
+                let mut reservations = host.reservations.lock().unwrap();
+                for (key, memory) in new_fixtures {
+                    reservations.insert(key, Reservation { memory, lease: None });
+                }
+            }
             next_id += 1;
             inflight.lock().unwrap().insert(id, Inflight { memory: case.memory, req: None });
             let (ctx, host, inflight) = (ctx.clone(), host.clone(), inflight.clone());
@@ -277,7 +384,7 @@ async fn dispatch(ctx: Arc<Ctx>, host: Arc<HostState>, queue: Arc<Mutex<VecDeque
                         f.req = Some(req);
                     }
                 };
-                let outcome = run_case(&ctx, &host, &case, started).await;
+                let outcome = run_case(&ctx, &host, &case, id, started).await;
                 inflight.lock().unwrap().remove(&id);
                 ctx.record(&host.agent.name, &case, &outcome);
             });
@@ -311,23 +418,27 @@ pub enum Status {
     Fail(String),
 }
 
-async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, started: impl FnOnce(u64)) -> Outcome {
+async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, started: impl FnOnce(u64)) -> Outcome {
     let start = Instant::now();
     let mut leases = Vec::new();
     // Test-scoped leases: torn down (or kept) after this test.
-    let mut own: Vec<(u64, Option<String>)> = Vec::new();
+    let mut own: Vec<(u64, Option<String>, LeaseKey)> = Vec::new();
     let setup: Result<()> = async {
-        let wanted = case.run_in.iter().map(|n| (n, Role::Environment)).chain(case.uses.iter().map(|n| (n, Role::Service)));
-        for (name, role) in wanted {
-            let (id, owned) = host.lease(ctx, name, role, case).await.with_context(|| format!("setting up fixture `{name}`"))?;
+        for (name, role) in fixtures_of(case) {
+            let (id, owned) = host.lease(ctx, name, role, case, slot).await.with_context(|| format!("setting up fixture `{name}`"))?;
             leases.push(id);
             if let Some(hint) = owned {
-                own.push((id, hint));
+                own.push((id, hint, lease_key(&ctx.fixtures[name], name, role, case, slot)));
             }
         }
         Ok(())
     }
     .await;
+    // Test-scoped instances that were never created (an earlier fixture failed).
+    {
+        let mut reservations = host.reservations.lock().unwrap();
+        reservations.retain(|k, r| !(k.2 == format!("test#{slot}") && r.lease.is_none()));
+    }
 
     let outcome = match setup {
         Err(e) => Outcome {
@@ -370,7 +481,7 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, started: impl FnOnce
     };
 
     let failed = outcome.status != Status::Pass;
-    for (id, hint) in own {
+    for (id, hint, key) in own {
         if failed && ctx.keep_fixtures {
             let msg = format!(
                 "kept fixture for {} on `{}`{}",
@@ -380,7 +491,10 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, started: impl FnOnce
             );
             host.kept.lock().unwrap().push((id, msg));
         } else {
-            let _ = host.agent.request(Request::Teardown { lease: id }).await;
+            if let Ok(Reply::TornDown { peak: Some(peak) }) = host.agent.request(Request::Teardown { lease: id }).await {
+                ctx.record_fixture(&key.0, peak);
+            }
+            host.reservations.lock().unwrap().remove(&key);
         }
     }
     outcome

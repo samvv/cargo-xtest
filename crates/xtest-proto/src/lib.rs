@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped whenever the messages below change incompatibly.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// Largest frame we accept. Blob uploads are chunked well below this.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -84,6 +84,7 @@ pub enum Request {
     },
     /// Current memory situation. Answered with [`Reply::Memory`].
     Memory,
+    /// Answered with [`Reply::TornDown`].
     Teardown {
         lease: u64,
     },
@@ -228,6 +229,10 @@ pub enum Reply {
         debug_hint: Option<String>,
     },
     Memory(MemoryInfo),
+    TornDown {
+        /// Peak memory of the fixture, if the agent could measure it.
+        peak: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +254,16 @@ pub struct MemoryInfo {
     pub total: u64,
     /// Memory each running process (by `Spawn` request id) uses right now, in bytes.
     pub running: BTreeMap<u64, u64>,
+    /// Memory of each fixture (by lease id) that the agent can measure.
+    pub fixtures: BTreeMap<u64, FixtureUsage>,
+}
+
+/// Memory of a fixture's own containers (not the tests in them), without
+/// reclaimable file cache.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct FixtureUsage {
+    pub current: u64,
+    pub peak: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

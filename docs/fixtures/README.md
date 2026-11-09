@@ -61,6 +61,7 @@ same error.
 |---|---|---|
 | `ready` | docker, k3d | a check that must pass before tests start; see each kind |
 | `export` | docker, k3d | env vars for the tests; values may use the kind's templates |
+| `memory` | all | memory one instance needs, for [memory scheduling](../memory-scheduling.md#fixtures) |
 
 ## Debugging: `--keep-fixtures`
 

@@ -5,9 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use xtest_proto::FixtureUsage;
 
 /// `(MemAvailable, MemTotal)` in bytes.
 pub fn meminfo() -> io::Result<(u64, u64)> {
@@ -75,6 +77,53 @@ pub fn cgroup_of(pid: u32) -> Option<PathBuf> {
     let rel = text.lines().find_map(|l| l.strip_prefix("0::"))?;
     let dir = Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
     read_u64(&dir.join("memory.current")).map(|_| dir)
+}
+
+/// Memory a cgroup uses, without file cache the kernel can reclaim
+/// (`memory.current` minus `inactive_file` from `memory.stat`).
+pub fn cgroup_usage(cgroup: &Path) -> u64 {
+    let current = read_u64(&cgroup.join("memory.current")).unwrap_or(0);
+    let inactive = fs::read_to_string(cgroup.join("memory.stat"))
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("inactive_file ")?.trim().parse::<u64>().ok()))
+        .unwrap_or(0);
+    current.saturating_sub(inactive)
+}
+
+/// Memory of one fixture: the sum over its containers' cgroups, sampled in
+/// the background for as long as the fixture exists.
+pub struct FixtureMemory {
+    cgroups: Vec<PathBuf>,
+    current: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl FixtureMemory {
+    /// Starts sampling. Sampling stops once the returned `Arc` is dropped.
+    pub fn watch(cgroups: Vec<PathBuf>) -> Arc<FixtureMemory> {
+        let m = Arc::new(FixtureMemory { cgroups, current: AtomicU64::new(0), peak: AtomicU64::new(0) });
+        m.sample();
+        let weak = Arc::downgrade(&m);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let Some(m) = weak.upgrade() else { break };
+                m.sample();
+            }
+        });
+        m
+    }
+
+    pub fn sample(&self) -> FixtureUsage {
+        let current: u64 = self.cgroups.iter().map(|cg| cgroup_usage(cg)).sum();
+        self.current.store(current, Ordering::Relaxed);
+        let peak = self.peak.fetch_max(current, Ordering::Relaxed).max(current);
+        FixtureUsage { current, peak }
+    }
+
+    pub fn usage(&self) -> FixtureUsage {
+        FixtureUsage { current: self.current.load(Ordering::Relaxed), peak: self.peak.load(Ordering::Relaxed) }
+    }
 }
 
 /// Resident memory of the processes in `cgroup` whose environment contains

@@ -162,8 +162,8 @@ fn run(args: Args) -> Result<ExitCode> {
         target: target.clone(),
     })?;
     let files = files::collect(&ws.root, &ws.target_dir, &profile.include, &built.executables)?;
-    let fixtures = fixture_defs(&cfg, &ws.root, &files)?;
     let mut history = history::History::load(&ws.target_dir);
+    let fixtures = fixture_defs(&cfg, &ws.root, &files, &history)?;
 
     let width = hosts.iter().map(|h| h.name.len()).max().unwrap_or(5);
     let reporter = Reporter::new(width);
@@ -268,13 +268,13 @@ fn run(args: Args) -> Result<ExitCode> {
             }
 
             if args.list {
+                let source = |s: MemorySource| match s {
+                    MemorySource::Config => "config",
+                    MemorySource::Measured => "measured",
+                    MemorySource::Default => "default",
+                };
                 for c in &cases {
-                    let source = match c.memory_source {
-                        MemorySource::Config => "config",
-                        MemorySource::Measured => "measured",
-                        MemorySource::Default => "default",
-                    };
-                    let mut extra = format!(" [memory: {} ({source})]", format_size(c.memory));
+                    let mut extra = format!(" [memory: {} ({})]", format_size(c.memory), source(c.memory_source));
                     if let Some(e) = &c.run_in {
                         extra += &format!(" [run-in: {e}]");
                     }
@@ -282,6 +282,13 @@ fn run(args: Args) -> Result<ExitCode> {
                         extra += &format!(" [uses: {}]", c.uses.join(", "));
                     }
                     println!("{}{extra}", c.display());
+                }
+                let mut used: Vec<&String> = cases.iter().flat_map(|c| c.run_in.iter().chain(&c.uses)).collect();
+                used.sort();
+                used.dedup();
+                for name in used {
+                    let f = &fixtures[name];
+                    println!("fixture {name} [memory: {} ({})]", format_size(f.memory), source(f.memory_source));
                 }
                 return Ok(None);
             }
@@ -308,6 +315,22 @@ fn run(args: Args) -> Result<ExitCode> {
                     ctx.reporter.warn("interrupted, cleaning up");
                     return Ok(Some(ExitCode::from(130)));
                 }
+            }
+            // Peaks of the fixtures that are still up (run- and binary-scoped).
+            for h in &hosts {
+                for (name, peak) in h.fixture_peaks().await {
+                    ctx.record_fixture(&name, peak);
+                }
+            }
+            let fixture_peaks: Vec<(String, u64)> = ctx
+                .measured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(k, v)| Some((k.strip_prefix("fixture:")?.to_string(), *v)))
+                .collect();
+            for (name, peak) in fixture_peaks {
+                ctx.reporter.status("Fixture", &format!("{name}: peak {}", format_size(peak)));
             }
             let ok = ctx.reporter.summary(skipped);
             let measured = std::mem::take(&mut *ctx.measured.lock().unwrap());
@@ -380,7 +403,21 @@ fn check_host(agent: &client::Agent, target: Option<&str>, reporter: &Reporter) 
     Ok(())
 }
 
-fn fixture_defs(cfg: &Config, ws_root: &std::path::Path, files: &files::FileSet) -> Result<HashMap<String, FixtureDef>> {
+/// Memory assumed for a fixture that hasn't been measured yet.
+fn default_fixture_memory(f: &config::Fixture) -> u64 {
+    match f.kind {
+        FixtureKind::Docker => 256 << 20,
+        FixtureKind::Command => 0,
+        FixtureKind::K3d => (f.servers.unwrap_or(1).max(1) + f.agents.unwrap_or(0)) as u64 * (512 << 20),
+    }
+}
+
+fn fixture_defs(
+    cfg: &Config,
+    ws_root: &std::path::Path,
+    files: &files::FileSet,
+    history: &history::History,
+) -> Result<HashMap<String, FixtureDef>> {
     let port_re = regex::Regex::new(r"\{port:(\d+)\}").unwrap();
     let mut out = HashMap::new();
     for (name, f) in &cfg.fixture {
@@ -430,7 +467,12 @@ fn fixture_defs(cfg: &Config, ws_root: &std::path::Path, files: &files::FileSet)
                 cwd: ws_root.to_owned(),
             }),
         };
-        out.insert(name.clone(), FixtureDef { scope: f.scope, spec });
+        let (memory, memory_source) = match (&f.memory, history.peaks.get(&runner::fixture_history_key(name))) {
+            (Some(m), _) => (config::parse_size(m)?, MemorySource::Config),
+            (None, Some(&peak)) => (peak, MemorySource::Measured),
+            (None, None) => (default_fixture_memory(f), MemorySource::Default),
+        };
+        out.insert(name.clone(), FixtureDef { scope: f.scope, spec, memory, memory_source });
     }
     Ok(out)
 }

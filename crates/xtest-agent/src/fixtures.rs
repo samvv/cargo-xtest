@@ -156,7 +156,7 @@ async fn k3d_setup(
         let vars = k3d_vars(&cluster, &kubeconfig, network.as_deref()).await;
         let bin = provide_kubectl(s, &cluster, id).await.context("providing kubectl")?;
         let env = BTreeMap::from([("KUBECONFIG".to_string(), kubeconfig.display().to_string())]);
-        let lease = Lease { kind: LeaseKind::K3d { cluster: cluster.clone(), runner: None }, env, container: None, path: vec![bin] };
+        let lease = Lease { kind: LeaseKind::K3d { cluster: cluster.clone(), runner: None }, env, container: None, path: vec![bin], memory: None };
         if let Some(r) = &k.ready {
             let cmd: Vec<String> = r.cmd.iter().flatten().map(|a| fill(a, &vars)).collect::<Result<_>>()?;
             let mut env = lease.env.clone();
@@ -182,6 +182,14 @@ async fn k3d_setup(
                 Some(c) => format!("docker exec -it {} sh", c.name),
                 None => format!("KUBECONFIG={} {}/kubectl get pods -A", kubeconfig.display(), lease.path[0].display()),
             };
+            // The cluster's nodes (not the runner, whose memory is the tests').
+            let mut cgroups = Vec::new();
+            if let Ok(ids) = docker(["ps", "-q", "--filter", &format!("label=k3d.cluster={cluster}")]).await {
+                for id in ids.split_whitespace() {
+                    cgroups.extend(container_cgroup(id).await);
+                }
+            }
+            lease.memory = (!cgroups.is_empty()).then(|| memory::FixtureMemory::watch(cgroups));
             lease.kind = LeaseKind::K3d { cluster, runner: runner.as_ref().map(|c| c.name.clone()) };
             lease.container = runner;
             Ok((lease, Some(hint)))
@@ -374,6 +382,12 @@ async fn wait_for_command(
     }
 }
 
+/// The cgroup of a running container, if its memory can be read.
+async fn container_cgroup(name: &str) -> Option<std::path::PathBuf> {
+    let pid = docker(["inspect", "-f", "{{.State.Pid}}", name]).await.ok()?;
+    pid.trim().parse().ok().and_then(memory::cgroup_of)
+}
+
 /// Pulls or builds an image; returns the name to run.
 async fn ensure_image(s: &Session, image: &ImageSource) -> Result<String> {
     Ok(match image {
@@ -453,8 +467,7 @@ async fn start_environment(
     docker(&args).await.context("starting container")?;
 
     let inspected = async {
-        let pid = docker(["inspect", "-f", "{{.State.Pid}}", &name]).await?;
-        let cgroup = pid.trim().parse().ok().and_then(memory::cgroup_of);
+        let cgroup = container_cgroup(&name).await;
         let envs = docker(["inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", &name]).await?;
         let path = envs
             .lines()
@@ -494,7 +507,7 @@ async fn docker_setup(
             }
         }
         let hint = format!("docker exec -it {} sh", c.name);
-        let lease = Lease { kind: LeaseKind::Container(c.name.clone()), env: BTreeMap::new(), container: Some(c), path: vec![] };
+        let lease = Lease { kind: LeaseKind::Container(c.name.clone()), env: BTreeMap::new(), container: Some(c), path: vec![], memory: None };
         return Ok((lease, Some(hint)));
     }
 
@@ -534,7 +547,8 @@ async fn docker_setup(
     match started {
         Ok(env) => {
             let hint = format!("docker logs {name}");
-            Ok((Lease { kind: LeaseKind::Container(name), env, container: None, path: vec![] }, Some(hint)))
+            let memory = container_cgroup(&name).await.map(|cg| memory::FixtureMemory::watch(vec![cg]));
+            Ok((Lease { kind: LeaseKind::Container(name), env, container: None, path: vec![], memory }, Some(hint)))
         }
         Err(e) => {
             let _ = docker(["rm", "-f", &name]).await;
@@ -606,7 +620,7 @@ async fn command_setup(s: &Session, c: CommandSpec) -> Result<Lease> {
     };
     let handle = parsed.handle.unwrap_or_default();
     let teardown = c.teardown.map(|t| t.replace("{handle}", &shell_quote(&handle)));
-    Ok(Lease { kind: LeaseKind::Command { teardown, cwd: c.cwd }, env: parsed.env, container: None, path: vec![] })
+    Ok(Lease { kind: LeaseKind::Command { teardown, cwd: c.cwd }, env: parsed.env, container: None, path: vec![], memory: None })
 }
 
 fn shell_quote(s: &str) -> String {

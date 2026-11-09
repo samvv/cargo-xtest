@@ -70,6 +70,8 @@ pub struct Fixture {
     pub kind: FixtureKind,
     #[serde(default)]
     pub scope: Scope,
+    /// Memory the fixture itself needs; wins over the measured peak.
+    pub memory: Option<String>,
     // docker
     pub image: Option<String>,
     pub build: Option<BuildCfg>,
@@ -108,6 +110,7 @@ impl Fixture {
     fn set_fields(&self) -> Vec<&'static str> {
         let mut f = Vec::new();
         let mut add = |set: bool, name| if set { f.push(name) };
+        add(self.memory.is_some(), "memory");
         add(self.image.is_some(), "image");
         add(self.build.is_some(), "build");
         add(!self.env.is_empty(), "env");
@@ -248,12 +251,15 @@ impl Config {
     fn validate(&self) -> Result<()> {
         for (name, f) in &self.fixture {
             let allowed: &[&str] = match f.kind {
-                FixtureKind::Docker => &["image", "build", "env", "ports", "ready", "export"],
-                FixtureKind::Command => &["setup", "teardown"],
-                FixtureKind::K3d => &["image", "servers", "agents", "args", "timeout", "ready", "export", "runner", "network"],
+                FixtureKind::Docker => &["memory", "image", "build", "env", "ports", "ready", "export"],
+                FixtureKind::Command => &["memory", "setup", "teardown"],
+                FixtureKind::K3d => &["memory", "image", "servers", "agents", "args", "timeout", "ready", "export", "runner", "network"],
             };
             if let Some(bad) = f.set_fields().into_iter().find(|x| !allowed.contains(x)) {
                 bail!("fixture `{name}`: `{bad}` is not supported by {:?} fixtures", f.kind);
+            }
+            if let Some(m) = &f.memory {
+                parse_size(m).with_context(|| format!("fixture `{name}`: memory"))?;
             }
             if let (FixtureKind::K3d, Some(r)) = (f.kind, &f.ready) {
                 if r.tcp.is_some() {

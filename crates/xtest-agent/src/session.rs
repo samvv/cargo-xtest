@@ -60,6 +60,8 @@ pub struct Lease {
     /// Directories put in front of `PATH` (they must be visible in
     /// environment containers too, so they live under the run's tmp dir).
     pub path: Vec<PathBuf>,
+    /// The fixture's own memory (its containers, not the tests in them).
+    pub memory: Option<Arc<memory::FixtureMemory>>,
 }
 
 #[derive(Clone)]
@@ -232,10 +234,12 @@ impl Session {
             Request::Teardown { lease } => {
                 tokio::spawn(async move {
                     let l = self.state.lock().unwrap().leases.remove(&lease);
+                    let mut peak = None;
                     if let Some(l) = l {
+                        peak = l.memory.as_ref().map(|m| m.sample().peak).filter(|p| *p > 0);
                         fixtures::teardown(&self, l).await;
                     }
-                    self.reply(req, Ok(Reply::Ok));
+                    self.reply(req, Ok(Reply::TornDown { peak }));
                 });
             }
             Request::Shutdown { .. } => unreachable!("handled by the read loop"),
@@ -278,7 +282,15 @@ impl Session {
                 (req, used)
             })
             .collect();
-        Ok(MemoryInfo { available, total, running })
+        let fixtures = self
+            .state
+            .lock()
+            .unwrap()
+            .leases
+            .iter()
+            .filter_map(|(id, l)| Some((*id, l.memory.as_ref()?.usage())))
+            .collect();
+        Ok(MemoryInfo { available, total, running, fixtures })
     }
 
     fn materialize(&self, mirrors: Vec<PathBuf>, files: &[FileEntry]) -> Result<()> {

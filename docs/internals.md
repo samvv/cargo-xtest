@@ -57,8 +57,8 @@ incompatible change.
 | `Materialize` | `Ok` once the sandbox is built |
 | `Spawn` | a stream of `Output` events, then one `Exited` with status, duration and peak memory |
 | `Kill` | `Ok` |
-| `Setup`, `Teardown` | `Lease` with the fixture's env vars; `Ok` |
-| `Memory` | `MemAvailable`, total memory, and the current use of each running test |
+| `Setup`, `Teardown` | `Lease` with the fixture's env vars; `TornDown` with its peak memory |
+| `Memory` | `MemAvailable`, total memory, the current use of each running test, and the current and peak use of each fixture |
 | `Shutdown` | the agent cleans up and exits |
 
 ## Store and sandbox

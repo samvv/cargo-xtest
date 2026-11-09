@@ -94,6 +94,7 @@ and `uses` lists are combined.
 |---|---|---|
 | `kind` | required | `docker`, `command` or `k3d` |
 | `scope` | `"test"` | `test`, `binary` or `run`: how widely one instance is shared; see [scopes](fixtures/README.md#scopes) |
+| `memory` | measured, or a default per kind | memory one instance needs; see [memory scheduling](memory-scheduling.md#fixtures) |
 
 The other keys depend on the kind:
 [Docker](fixtures/docker.md#keys), [command](fixtures/command.md#keys) and
