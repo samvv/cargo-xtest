@@ -81,6 +81,15 @@ struct Args {
     /// Hash every file again instead of trusting the hash cache.
     #[arg(long)]
     rehash: bool,
+    /// Show test output live, line by line, prefixed with the host and test.
+    #[arg(long, alias = "nocapture")]
+    no_capture: bool,
+    /// Also show the output of passing tests.
+    #[arg(long)]
+    success_output: bool,
+    /// Run at most this many tests at once on each host (`-j1`: one at a time).
+    #[arg(short = 'j', long, value_parser = clap::value_parser!(u32).range(1..))]
+    jobs: Option<u32>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -170,7 +179,10 @@ fn run(args: Args) -> Result<ExitCode> {
     let fixtures = fixture_defs(&cfg, &ws.root, &files, &history)?;
 
     let width = hosts.iter().map(|h| h.name.len()).max().unwrap_or(5);
-    let reporter = Reporter::new(width);
+    let mut reporter = Reporter::new(width);
+    reporter.live = args.no_capture;
+    reporter.success_output = args.success_output;
+    let jobs = args.jobs.map(|j| j as usize);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let total: u64 = files.sizes.values().sum();
@@ -193,6 +205,7 @@ fn run(args: Args) -> Result<ExitCode> {
                 let agent = client::Agent::connect(&h).await.with_context(|| format!("host `{}`", h.name))?;
                 let (n, bytes) = runner::sync(&agent, &files).await.with_context(|| format!("syncing to `{}`", h.name))?;
                 let slots = h.slots.unwrap_or(agent.info.cpus as usize).max(1);
+                let slots = jobs.map_or(slots, |j| slots.min(j));
                 anyhow::Ok((i, HostState::new(agent, slots), n, bytes))
             });
         }

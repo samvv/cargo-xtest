@@ -16,16 +16,42 @@ use xtest_proto::*;
 use crate::config::Host;
 
 pub enum ProcEvent {
-    #[allow(dead_code)] // the stream is not shown separately yet
     Output(Stream, Vec<u8>),
     Exited(Exit, Duration, Option<u64>),
 }
 
 pub struct RunResult {
     pub exit: Exit,
-    pub output: Vec<u8>,
+    pub output: Output,
     pub duration: Duration,
     pub peak_memory: Option<u64>,
+}
+
+/// A process's output in the order it arrived, as runs of one stream.
+#[derive(Debug, Default, Clone)]
+pub struct Output(pub Vec<(Stream, Vec<u8>)>);
+
+impl Output {
+    fn push(&mut self, stream: Stream, data: &[u8]) {
+        match self.0.last_mut() {
+            Some((s, buf)) if *s == stream => buf.extend_from_slice(data),
+            _ => self.0.push((stream, data.to_vec())),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|(_, d)| d.is_empty())
+    }
+
+    /// Everything written to `stream`.
+    pub fn of(&self, stream: Stream) -> Vec<u8> {
+        self.0.iter().filter(|(s, _)| *s == stream).flat_map(|(_, d)| d.iter().copied()).collect()
+    }
+
+    /// Both streams, interleaved as they arrived.
+    pub fn all(&self) -> Vec<u8> {
+        self.0.iter().flat_map(|(_, d)| d.iter().copied()).collect()
+    }
 }
 
 #[derive(Default)]
@@ -222,17 +248,26 @@ impl Agent {
 
     /// Runs a process to completion and returns its exit and combined output.
     pub async fn run(&self, spec: SpawnSpec) -> Result<RunResult> {
-        self.run_tracked(spec, |_| {}).await
+        self.run_tracked(spec, |_| {}, |_, _| {}).await
     }
 
-    /// Like `run`, and tells `started` the request id the agent knows the process by.
-    pub async fn run_tracked(&self, spec: SpawnSpec, started: impl FnOnce(u64)) -> Result<RunResult> {
+    /// Like `run`; tells `started` the request id the agent knows the process
+    /// by, and passes each piece of output to `on_output` as it arrives.
+    pub async fn run_tracked(
+        &self,
+        spec: SpawnSpec,
+        started: impl FnOnce(u64),
+        mut on_output: impl FnMut(Stream, &[u8]),
+    ) -> Result<RunResult> {
         let (req, mut rx) = self.spawn(spec);
         started(req);
-        let mut output = Vec::new();
+        let mut output = Output::default();
         while let Some(ev) = rx.recv().await {
             match ev {
-                ProcEvent::Output(_, data) => output.extend(data),
+                ProcEvent::Output(stream, data) => {
+                    on_output(stream, &data);
+                    output.push(stream, &data);
+                }
                 ProcEvent::Exited(exit, duration, peak_memory) => {
                     return Ok(RunResult { exit, output, duration, peak_memory })
                 }

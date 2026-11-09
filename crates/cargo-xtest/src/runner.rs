@@ -13,7 +13,7 @@ use tokio::task::JoinSet;
 use xtest_proto::*;
 
 use crate::cargo::TestBinary;
-use crate::client::Agent;
+use crate::client::{Agent, Output};
 use crate::config::{format_size, Scope};
 use crate::files::FileSet;
 use crate::history::Measured;
@@ -279,10 +279,11 @@ pub async fn discover(agent: &Agent, bins: &[Arc<TestBinary>]) -> Result<Vec<(Ar
             }
         };
         let parse = |r: crate::client::RunResult| -> Result<Vec<String>> {
-            let text = String::from_utf8_lossy(&r.output);
             if !r.exit.success() {
+                let text = String::from_utf8_lossy(&r.output.all()).into_owned();
                 bail!("listing tests in {} failed ({}):\n{text}", bin.id(), r.exit);
             }
+            let text = String::from_utf8_lossy(&r.output.of(Stream::Stdout)).into_owned();
             Ok(text.lines().filter_map(|l| l.strip_suffix(": test")).map(String::from).collect())
         };
         let all = parse(agent.run(list(None)).await?)?;
@@ -431,7 +432,7 @@ pub struct Outcome {
     /// How long the test process ran, if it ran to completion (not for
     /// timeouts or failed fixture setups). Saved for ordering later runs.
     pub ran_for: Option<Duration>,
-    pub output: Vec<u8>,
+    pub output: Output,
     pub peak_memory: Option<u64>,
 }
 
@@ -468,7 +469,7 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, started
             status: Status::Fail(format!("{e:#}")),
             duration: start.elapsed(),
             ran_for: None,
-            output: vec![],
+            output: Output::default(),
             peak_memory: None,
         },
         Ok(()) => {
@@ -487,7 +488,15 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, started
                 timeout: case.timeout,
                 leases: leases.clone(),
             };
-            match host.agent.run_tracked(spec, started).await {
+            let mut live = LiveLines::default();
+            let on_output = |stream, data: &[u8]| {
+                if ctx.reporter.live {
+                    live.push(stream, data, |stream, line| ctx.reporter.live(&host.agent.name, case, stream, line));
+                }
+            };
+            let result = host.agent.run_tracked(spec, started, on_output).await;
+            live.flush(|stream, line| ctx.reporter.live(&host.agent.name, case, stream, line));
+            match result {
                 Ok(r) => Outcome {
                     status: if r.exit.success() { Status::Pass } else { Status::Fail(r.exit.to_string()) },
                     duration: r.duration,
@@ -499,7 +508,7 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, started
                     status: Status::Fail(format!("{e:#}")),
                     duration: start.elapsed(),
                     ran_for: None,
-                    output: vec![],
+                    output: Output::default(),
                     peak_memory: None,
                 },
             }
@@ -532,11 +541,49 @@ struct Counts {
     failed: Vec<String>,
 }
 
+/// Splits a test's output into lines for `--no-capture`, per stream. A
+/// partial line waits for its newline, or for [`flush`](Self::flush).
+#[derive(Default)]
+struct LiveLines {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl LiveLines {
+    fn push(&mut self, stream: Stream, data: &[u8], mut emit: impl FnMut(Stream, &[u8])) {
+        let buf = match stream {
+            Stream::Stdout => &mut self.stdout,
+            Stream::Stderr => &mut self.stderr,
+        };
+        buf.extend_from_slice(data);
+        let mut start = 0;
+        while let Some(nl) = buf[start..].iter().position(|b| *b == b'\n') {
+            emit(stream, &buf[start..start + nl]);
+            start += nl + 1;
+        }
+        buf.drain(..start);
+    }
+
+    /// Emits what is left of unfinished lines.
+    fn flush(&mut self, mut emit: impl FnMut(Stream, &[u8])) {
+        for (stream, buf) in [(Stream::Stdout, &mut self.stdout), (Stream::Stderr, &mut self.stderr)] {
+            if !buf.is_empty() {
+                emit(stream, buf);
+                buf.clear();
+            }
+        }
+    }
+}
+
 pub struct Reporter {
     color: bool,
     start: Instant,
     host_width: usize,
     counts: Mutex<Counts>,
+    /// `--no-capture`: print test output live, line by line.
+    pub live: bool,
+    /// `--success-output`: also show the output of passing tests.
+    pub success_output: bool,
 }
 
 impl Reporter {
@@ -546,6 +593,38 @@ impl Reporter {
             start: Instant::now(),
             host_width,
             counts: Default::default(),
+            live: false,
+            success_output: false,
+        }
+    }
+
+    /// One line of a test's output, with `--no-capture`. stderr lines use `!`
+    /// instead of `|` (and are colored on a terminal).
+    fn live(&self, host: &str, case: &Case, stream: Stream, line: &[u8]) {
+        let line = String::from_utf8_lossy(line);
+        let line = line.strip_suffix('\r').unwrap_or(&line);
+        let (sep, text) = match stream {
+            Stream::Stdout => ("|", line.to_string()),
+            Stream::Stderr => ("!", self.paint("33", line)),
+        };
+        let prefix = self.paint("2", &format!("{host:<w$} {} {sep}", case.display(), w = self.host_width));
+        let _ = writeln!(std::io::stderr().lock(), "{prefix} {text}");
+    }
+
+    /// A test's captured output, with stderr colored on a terminal.
+    fn write_output(&self, err: &mut impl Write, output: &Output) {
+        for (stream, data) in &output.0 {
+            match stream {
+                Stream::Stdout => {
+                    let _ = err.write_all(data);
+                }
+                Stream::Stderr => {
+                    let _ = write!(err, "{}", self.paint("33", &String::from_utf8_lossy(data)));
+                }
+            }
+        }
+        if !output.all().ends_with(b"\n") {
+            let _ = writeln!(err);
         }
     }
 
@@ -577,16 +656,21 @@ impl Reporter {
             case.display(),
             w = self.host_width
         );
+        // With --no-capture, the output was already shown as it came.
+        let show = !self.live && !o.output.is_empty();
         let mut counts = self.counts.lock().unwrap();
         match &o.status {
-            Status::Pass => counts.passed += 1,
+            Status::Pass => {
+                counts.passed += 1;
+                if show && self.success_output {
+                    let _ = writeln!(err, "{}", self.paint("2", &format!("--- {} (output) ---", case.display())));
+                    self.write_output(&mut err, &o.output);
+                }
+            }
             Status::Fail(reason) => {
                 let _ = writeln!(err, "{}", self.paint("31", &format!("--- {} ({reason}) ---", case.display())));
-                if !o.output.is_empty() {
-                    let _ = err.write_all(&o.output);
-                    if !o.output.ends_with(b"\n") {
-                        let _ = writeln!(err);
-                    }
+                if show {
+                    self.write_output(&mut err, &o.output);
                 }
                 counts.failed.push(format!("{} on `{host}`", case.display()));
             }
@@ -649,6 +733,22 @@ mod tests {
         order(&mut cases);
         // Known: 1, 5, 30 → median 5; the unknown test ties with `c` and keeps its place.
         assert_eq!(names(&cases), ["b", "new", "c", "a"]);
+    }
+
+    #[test]
+    fn live_lines_wait_for_newlines() {
+        let mut live = LiveLines::default();
+        let mut got = Vec::new();
+        let mut emit = |s: Stream, l: &[u8]| got.push((s, String::from_utf8_lossy(l).into_owned()));
+        live.push(Stream::Stdout, b"one\ntw", &mut emit);
+        live.push(Stream::Stderr, b"err", &mut emit);
+        live.push(Stream::Stdout, b"o\nthree", &mut emit);
+        live.flush(&mut emit);
+        let s = |t: &str| t.to_string();
+        assert_eq!(
+            got,
+            [(Stream::Stdout, s("one")), (Stream::Stdout, s("two")), (Stream::Stdout, s("three")), (Stream::Stderr, s("err"))]
+        );
     }
 
     #[test]

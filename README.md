@@ -113,6 +113,9 @@ cargo xtest [OPTIONS] [FILTERS]...
 | `--include-ignored` | Run ignored tests too |
 | `--keep-fixtures` | Keep the test-scoped fixtures of failed tests, and print how to inspect them (e.g. `docker exec -it ... sh`); see [fixtures](docs/fixtures/README.md#debugging---keep-fixtures) |
 | `--list` | List the tests that would run, in the order they would start, with their memory and duration estimates, then exit |
+| `--no-capture` | Show test output live, line by line, prefixed with the host and test. stderr lines are marked with `!` instead of `\|`. Alias: `--nocapture` |
+| `--success-output` | Also show the output of passing tests (by default, output is shown only for failures) |
+| `-j`, `--jobs <N>` | Run at most `N` tests at once on each host; `-j1` keeps `--no-capture` output from interleaving |
 | `--rehash` | Hash every file again instead of trusting the [hash cache](docs/internals.md#hash-cache) |
 | `--config <FILE>` | Config file to use instead of `.config/xtest.toml` in the workspace root. `<name>.local.toml` next to it is merged over it. |
 

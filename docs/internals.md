@@ -140,8 +140,10 @@ a warning.
 
 - Each test runs in its own process group, so killing it (on timeout,
   `Kill` or shutdown) sends `SIGKILL` to everything it started.
-- stdout and stderr are streamed to the controller, which shows them only for
-  failed tests.
+- stdout and stderr are streamed to the controller as they are written, as
+  separate streams. The controller keeps them in order and shows them for
+  failed tests (stderr colored), for every test with `--success-output`, or
+  line by line as they arrive with `--no-capture`.
 - Peak memory comes from `wait4`, a container's cgroup, or sampling; see
   [memory scheduling](memory-scheduling.md#how-peaks-are-measured).
 
