@@ -3,6 +3,13 @@
 A test runner for Cargo that runs tests on other hosts and inside fixtures
 such as Docker containers.
 
+- **Remote hosts:** runs tests on other machines over SSH, at their original paths.
+- **Fixtures:** Docker containers, k3d clusters and setup scripts, always torn down afterwards.
+- **Memory-aware scheduling:** starts tests in parallel only while they fit in free memory.
+- **Fast sync:** uploads only changed files to a content-addressed store.
+- **Isolation:** one process per test, with its own temp directory and timeout.
+- **Self-cleaning:** removes leftovers after crashes and keeps caches under a size cap.
+
 ```
 cargo install --path crates/cargo-xtest   # installs cargo-xtest and xtest-agent
 cargo xtest                               # in any workspace
