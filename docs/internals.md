@@ -21,8 +21,9 @@ or as a local process) and talks to it over the agent's stdin and stdout.
    builds the tests; the JSON output lists the test binaries. `harness = false`
    targets are found by reading the manifests.
 2. **Collect files.** The workspace is walked with `.gitignore` rules, plus the
-   profile's `include` globs and the built executables. Every file is hashed
-   (SHA-256, in parallel).
+   profile's `include` globs and the built executables. Files are hashed
+   (SHA-256, in parallel), except those whose hash is in the cache; see
+   [Hash cache](#hash-cache).
 3. **Connect.** For an SSH host, the controller checks whether this exact
    agent build is installed (`<root>/agent/<hash>/xtest-agent`), uploads it if
    not, and starts `xtest-agent serve --stdio`. Remote commands are wrapped in
@@ -41,6 +42,26 @@ or as a local process) and talks to it over the agent's stdin and stdout.
 9. **Shut down.** The controller sends `Shutdown`. The agent kills what is
    still running, tears down fixtures (except kept ones), and removes the run
    directory.
+
+## Hash cache
+
+`<target dir>/xtest/hashes.json` maps each file's path to its hash, together
+with its *stamp*: size, mtime, ctime, inode and device. A cached hash is used
+only while the stamp is unchanged. ctime can't be set by users, so a file whose
+content changed but whose mtime was put back is still hashed again.
+
+Two cases are never cached, and are hashed again on the next run:
+
+- **Racy files:** the mtime or ctime is within 2 seconds of when the stamp was
+  read. On filesystems with coarse timestamps, the file could change again
+  within the same tick without its stamp changing (git's index has the same
+  problem).
+- **Files that changed while being hashed:** the stamp differs before and after.
+
+The cache is rewritten after every run (atomically, through a temp file), so
+removed files drop out. A missing, corrupt or older-format cache is ignored.
+`--rehash` ignores the cache for one run. The `Syncing` line shows how many
+files were hashed and how many came from the cache.
 
 ## Protocol
 

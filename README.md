@@ -96,6 +96,7 @@ cargo xtest [OPTIONS] [FILTERS]...
 | `--include-ignored` | Run ignored tests too |
 | `--keep-fixtures` | Keep the test-scoped fixtures of failed tests, and print how to inspect them (e.g. `docker exec -it ... sh`); see [fixtures](docs/fixtures/README.md#debugging---keep-fixtures) |
 | `--list` | List the tests that would run, with their memory estimates, then exit |
+| `--rehash` | Hash every file again instead of trusting the [hash cache](docs/internals.md#hash-cache) |
 | `--config <FILE>` | Config file to use instead of `.config/xtest.toml` in the workspace root. `<name>.local.toml` next to it is merged over it. |
 
 Exit codes: 0 when all tests pass, 100 when any test fails, 1 on errors,

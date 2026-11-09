@@ -6,6 +6,7 @@ mod client;
 mod config;
 mod files;
 mod filter;
+mod hashcache;
 mod history;
 mod runner;
 
@@ -77,6 +78,9 @@ struct Args {
     /// List the tests that would run, then exit.
     #[arg(long)]
     list: bool,
+    /// Hash every file again instead of trusting the hash cache.
+    #[arg(long)]
+    rehash: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -161,7 +165,7 @@ fn run(args: Args) -> Result<ExitCode> {
         release: args.release,
         target: target.clone(),
     })?;
-    let files = files::collect(&ws.root, &ws.target_dir, &profile.include, &built.executables)?;
+    let files = files::collect(&ws.root, &ws.target_dir, &profile.include, &built.executables, args.rehash)?;
     let mut history = history::History::load(&ws.target_dir);
     let fixtures = fixture_defs(&cfg, &ws.root, &files, &history)?;
 
@@ -172,7 +176,14 @@ fn run(args: Args) -> Result<ExitCode> {
         let total: u64 = files.sizes.values().sum();
         reporter.status(
             "Syncing",
-            &format!("{} files ({:.1} MB) to {} host(s)", files.files.len(), total as f64 / 1e6, hosts.len()),
+            &format!(
+                "{} files ({:.1} MB, {} hashed, {} cached) to {} host(s)",
+                files.files.len(),
+                total as f64 / 1e6,
+                files.hashed,
+                files.files.len() - files.hashed,
+                hosts.len()
+            ),
         );
         let files = Arc::new(files);
         let mut set = tokio::task::JoinSet::new();
