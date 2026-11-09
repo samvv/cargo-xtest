@@ -87,6 +87,12 @@ struct Args {
     /// Also show the output of passing tests.
     #[arg(long)]
     success_output: bool,
+    /// Rerun a failing test up to this many times (overrides the config).
+    #[arg(long)]
+    retries: Option<u32>,
+    /// Start no new tests after the first failure.
+    #[arg(long)]
+    fail_fast: bool,
     /// Run at most this many tests at once on each host (`-j1`: one at a time).
     #[arg(short = 'j', long, value_parser = clap::value_parser!(u32).range(1..))]
     jobs: Option<u32>,
@@ -257,6 +263,7 @@ fn run(args: Args) -> Result<ExitCode> {
                     memory: profile.memory,
                     memory_source: MemorySource::Default,
                     expected: None,
+                    retries: profile.retries,
                 };
                 if let Some(peak) = history.peak(&case.display()) {
                     case.memory = peak;
@@ -280,7 +287,13 @@ fn run(args: Args) -> Result<ExitCode> {
                             case.memory = config::parse_size(m)?;
                             case.memory_source = MemorySource::Config;
                         }
+                        if let Some(r) = o.retries {
+                            case.retries = r;
+                        }
                     }
+                }
+                if let Some(r) = args.retries {
+                    case.retries = r;
                 }
                 let selected = (args.filters.is_empty() || args.filters.iter().any(|f| name.contains(f.as_str())))
                     && (exprs.is_empty() || exprs.iter().any(|e| e.matches(&subject)))
@@ -340,9 +353,12 @@ fn run(args: Args) -> Result<ExitCode> {
                 memory_reserve: profile.memory_reserve,
                 reporter,
                 measured: Default::default(),
+                fail_fast: args.fail_fast,
+                stopped: Default::default(),
             });
+            let not_run;
             tokio::select! {
-                _ = runner::run_all(ctx.clone(), &hosts, cases) => {}
+                n = runner::run_all(ctx.clone(), &hosts, cases) => not_run = n,
                 _ = tokio::signal::ctrl_c() => {
                     ctx.reporter.warn("interrupted, cleaning up");
                     return Ok(Some(ExitCode::from(130)));
@@ -365,7 +381,7 @@ fn run(args: Args) -> Result<ExitCode> {
             for (name, peak) in fixture_peaks {
                 ctx.reporter.status("Fixture", &format!("{name}: peak {}", format_size(peak)));
             }
-            let ok = ctx.reporter.summary(skipped);
+            let ok = ctx.reporter.summary(skipped, not_run);
             let measured = std::mem::take(&mut *ctx.measured.lock().unwrap());
             if let Err(e) = history.save(measured) {
                 ctx.reporter.warn(&format!("could not save memory history: {e:#}"));

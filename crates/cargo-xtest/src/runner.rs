@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,8 @@ pub struct Case {
     pub memory_source: MemorySource,
     /// How long it took last time, if known.
     pub expected: Option<Duration>,
+    /// How many times to rerun it if it fails.
+    pub retries: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -198,10 +200,13 @@ pub struct Ctx {
     pub reporter: Reporter,
     /// What this run measured, for the history.
     pub measured: Mutex<Measured>,
+    /// `--fail-fast`: start no new tests after the first failure.
+    pub fail_fast: bool,
+    pub stopped: AtomicBool,
 }
 
 impl Ctx {
-    fn record(&self, host: &str, case: &Case, outcome: &Outcome) {
+    fn record(&self, host: &str, case: &Case, outcome: &Outcome, attempt: u32) {
         {
             let mut measured = self.measured.lock().unwrap();
             if let Some(peak) = outcome.peak_memory {
@@ -211,7 +216,10 @@ impl Ctx {
                 measured.durations.insert(case.display(), d);
             }
         }
-        self.reporter.report(host, case, outcome);
+        self.reporter.report(host, case, outcome, attempt);
+        if self.fail_fast && outcome.status != Status::Pass {
+            self.stopped.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Records a fixture instance's peak; the history keeps the largest of this run.
@@ -323,7 +331,8 @@ pub fn order(cases: &mut [Case]) {
     cases.sort_by_key(|c| (std::cmp::Reverse(c.expected.unwrap_or(median)), std::cmp::Reverse(c.memory)));
 }
 
-pub async fn run_all(ctx: Arc<Ctx>, hosts: &[Arc<HostState>], mut cases: Vec<Case>) {
+/// Runs every test; returns how many were not started (after `--fail-fast`).
+pub async fn run_all(ctx: Arc<Ctx>, hosts: &[Arc<HostState>], mut cases: Vec<Case>) -> usize {
     order(&mut cases);
     let queue = Arc::new(Mutex::new(VecDeque::from(cases)));
     let mut set = JoinSet::new();
@@ -331,6 +340,8 @@ pub async fn run_all(ctx: Arc<Ctx>, hosts: &[Arc<HostState>], mut cases: Vec<Cas
         set.spawn(dispatch(ctx.clone(), host.clone(), queue.clone()));
     }
     while set.join_next().await.is_some() {}
+    let not_run = queue.lock().unwrap().len();
+    not_run
 }
 
 /// A test started on a host that may not have reached its full memory use yet.
@@ -352,7 +363,7 @@ async fn dispatch(ctx: Arc<Ctx>, host: Arc<HostState>, queue: Arc<Mutex<VecDeque
     let mut running = JoinSet::new();
     let mut next_id = 0usize;
     loop {
-        while running.len() < host.slots && !queue.lock().unwrap().is_empty() {
+        while running.len() < host.slots && !queue.lock().unwrap().is_empty() && !ctx.stopped.load(Ordering::Relaxed) {
             let mem = host.agent.memory().await.ok();
             let free = mem.as_ref().map(|m| {
                 let owed: u64 = inflight
@@ -399,19 +410,34 @@ async fn dispatch(ctx: Arc<Ctx>, host: Arc<HostState>, queue: Arc<Mutex<VecDeque
             inflight.lock().unwrap().insert(id, Inflight { memory: case.memory, req: None });
             let (ctx, host, inflight) = (ctx.clone(), host.clone(), inflight.clone());
             running.spawn(async move {
-                let track = inflight.clone();
-                let started = move |req| {
-                    if let Some(f) = track.lock().unwrap().get_mut(&id) {
-                        f.req = Some(req);
+                let mut attempt = 1;
+                let outcome = loop {
+                    let track = inflight.clone();
+                    let started = move |req| {
+                        if let Some(f) = track.lock().unwrap().get_mut(&id) {
+                            f.req = Some(req);
+                        }
+                    };
+                    let last = attempt > case.retries;
+                    let outcome = run_case(&ctx, &host, &case, id, last, started).await;
+                    if outcome.status == Status::Pass || last {
+                        break outcome;
+                    }
+                    ctx.reporter.retry(&host.agent.name, &case, &outcome, attempt);
+                    attempt += 1;
+                    // The next attempt gets fresh test-scoped fixtures.
+                    let fresh = host.unreserved(&ctx, &case, id);
+                    let mut reservations = host.reservations.lock().unwrap();
+                    for (key, memory) in fresh {
+                        reservations.insert(key, Reservation { memory, lease: None });
                     }
                 };
-                let outcome = run_case(&ctx, &host, &case, id, started).await;
                 inflight.lock().unwrap().remove(&id);
-                ctx.record(&host.agent.name, &case, &outcome);
+                ctx.record(&host.agent.name, &case, &outcome, attempt);
             });
         }
         if running.is_empty() {
-            if queue.lock().unwrap().is_empty() {
+            if queue.lock().unwrap().is_empty() || ctx.stopped.load(Ordering::Relaxed) {
                 return;
             }
             continue;
@@ -442,7 +468,9 @@ pub enum Status {
     Fail(String),
 }
 
-async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, started: impl FnOnce(u64)) -> Outcome {
+/// Runs one attempt of a test. `last` is false while retries remain; only a
+/// failed last attempt keeps its fixtures for `--keep-fixtures`.
+async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, last: bool, started: impl FnOnce(u64)) -> Outcome {
     let start = Instant::now();
     let mut leases = Vec::new();
     // Test-scoped leases: torn down (or kept) after this test.
@@ -517,7 +545,7 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, started
 
     let failed = outcome.status != Status::Pass;
     for (id, hint, key) in own {
-        if failed && ctx.keep_fixtures {
+        if failed && last && ctx.keep_fixtures {
             let msg = format!(
                 "kept fixture for {} on `{}`{}",
                 case.display(),
@@ -538,6 +566,8 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, started
 #[derive(Default)]
 struct Counts {
     passed: usize,
+    /// Passed, but only after failing first.
+    flaky: Vec<String>,
     failed: Vec<String>,
 }
 
@@ -640,12 +670,7 @@ impl Reporter {
         eprintln!("{} {msg}", self.paint("1;33", "warning:"));
     }
 
-    fn report(&self, host: &str, case: &Case, o: &Outcome) {
-        let (label, code) = match &o.status {
-            Status::Pass => ("PASS", "1;32"),
-            Status::Fail(_) => ("FAIL", "1;31"),
-        };
-        let mut err = std::io::stderr().lock();
+    fn result_line(&self, err: &mut impl Write, label: &str, code: &str, host: &str, case: &Case, o: &Outcome) {
         let mem = o.peak_memory.map(format_size).unwrap_or_else(|| "-".into());
         let _ = writeln!(
             err,
@@ -656,19 +681,48 @@ impl Reporter {
             case.display(),
             w = self.host_width
         );
+    }
+
+    /// A failed attempt that will be retried.
+    fn retry(&self, host: &str, case: &Case, o: &Outcome, attempt: u32) {
+        let mut err = std::io::stderr().lock();
+        self.result_line(&mut err, &format!("TRY {attempt} FAIL"), "1;33", host, case, o);
+        if let Status::Fail(reason) = &o.status {
+            let header = format!("--- {} (try {attempt}: {reason}) ---", case.display());
+            let _ = writeln!(err, "{}", self.paint("33", &header));
+        }
+        if !self.live && !o.output.is_empty() {
+            self.write_output(&mut err, &o.output);
+        }
+    }
+
+    /// The final result of a test, after `attempt` tries.
+    fn report(&self, host: &str, case: &Case, o: &Outcome, attempt: u32) {
+        let flaky = o.status == Status::Pass && attempt > 1;
+        let (label, code) = match &o.status {
+            Status::Pass if flaky => ("FLAKY", "1;33"),
+            Status::Pass => ("PASS", "1;32"),
+            Status::Fail(_) => ("FAIL", "1;31"),
+        };
+        let mut err = std::io::stderr().lock();
+        self.result_line(&mut err, label, code, host, case, o);
         // With --no-capture, the output was already shown as it came.
         let show = !self.live && !o.output.is_empty();
         let mut counts = self.counts.lock().unwrap();
         match &o.status {
             Status::Pass => {
                 counts.passed += 1;
+                if flaky {
+                    counts.flaky.push(format!("{} on `{host}` (passed on try {attempt})", case.display()));
+                }
                 if show && self.success_output {
                     let _ = writeln!(err, "{}", self.paint("2", &format!("--- {} (output) ---", case.display())));
                     self.write_output(&mut err, &o.output);
                 }
             }
             Status::Fail(reason) => {
-                let _ = writeln!(err, "{}", self.paint("31", &format!("--- {} ({reason}) ---", case.display())));
+                let tries = if attempt > 1 { format!(", {attempt} tries") } else { String::new() };
+                let _ = writeln!(err, "{}", self.paint("31", &format!("--- {} ({reason}{tries}) ---", case.display())));
                 if show {
                     self.write_output(&mut err, &o.output);
                 }
@@ -678,19 +732,27 @@ impl Reporter {
     }
 
     /// Prints the summary; returns whether everything passed.
-    pub fn summary(&self, skipped: usize) -> bool {
+    pub fn summary(&self, skipped: usize, not_run: usize) -> bool {
         let c = self.counts.lock().unwrap();
         let total = c.passed + c.failed.len();
+        let flaky = if c.flaky.is_empty() { String::new() } else { format!(" ({} flaky)", c.flaky.len()) };
+        let not_run_note = if not_run > 0 { format!(", {not_run} not run") } else { String::new() };
         eprintln!("------------");
         eprintln!(
-            "{} [{:>9.3}s] {total} tests run: {} passed, {} failed, {skipped} skipped",
+            "{} [{:>9.3}s] {total} tests run: {} passed{flaky}, {} failed, {skipped} skipped{not_run_note}",
             self.paint("1;32", &format!("{:>12}", "Summary")),
             self.start.elapsed().as_secs_f64(),
             c.passed,
             c.failed.len()
         );
+        for f in &c.flaky {
+            eprintln!("{} {f}", self.paint("1;33", &format!("{:>12}", "FLAKY")));
+        }
         for f in &c.failed {
             eprintln!("{} {f}", self.paint("1;31", &format!("{:>12}", "FAIL")));
+        }
+        if not_run > 0 {
+            self.warn(&format!("stopped after the first failure (--fail-fast): {not_run} tests not run"));
         }
         c.failed.is_empty()
     }
@@ -720,6 +782,7 @@ mod tests {
             memory,
             memory_source: MemorySource::Default,
             expected: expected.map(Duration::from_secs),
+            retries: 0,
         }
     }
 

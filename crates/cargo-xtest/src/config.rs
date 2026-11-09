@@ -30,6 +30,8 @@ pub struct Profile {
     pub memory: Option<String>,
     /// Memory kept free on every host; tests only start while this much remains.
     pub memory_reserve: Option<String>,
+    /// How many times to rerun a failing test.
+    pub retries: Option<u32>,
     #[serde(default)]
     pub overrides: Vec<Override>,
 }
@@ -45,6 +47,8 @@ pub struct Override {
     pub timeout: Option<String>,
     /// Memory this test needs; wins over the measured peak.
     pub memory: Option<String>,
+    /// How many times to rerun these tests when they fail.
+    pub retries: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
@@ -191,6 +195,7 @@ pub struct Resolved {
     pub timeout: Option<Duration>,
     pub memory: u64,
     pub memory_reserve: u64,
+    pub retries: u32,
     pub overrides: Vec<(Filter, Override)>,
 }
 
@@ -243,6 +248,7 @@ impl Config {
             p.timeout = lp.timeout.or(p.timeout.take());
             p.memory = lp.memory.or(p.memory.take());
             p.memory_reserve = lp.memory_reserve.or(p.memory_reserve.take());
+            p.retries = lp.retries.or(p.retries.take());
             p.overrides.extend(lp.overrides);
         }
         self.fixture.extend(local.fixture);
@@ -348,6 +354,7 @@ impl Config {
             timeout: timeout.as_deref().map(parse_duration).transpose()?,
             memory: memory.as_deref().map(parse_size).transpose()?.unwrap_or(DEFAULT_MEMORY),
             memory_reserve: reserve.as_deref().map(parse_size).transpose()?.unwrap_or(DEFAULT_MEMORY_RESERVE),
+            retries: p.retries.or(default.retries).unwrap_or(0),
             overrides,
         })
     }

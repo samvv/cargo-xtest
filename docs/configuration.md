@@ -66,6 +66,7 @@ Choose a profile with `--profile <name>`; the default is `default`.
 | `timeout` | none | how long one test may run before it is killed |
 | `memory` | `"256M"` | memory assumed for a test that hasn't been measured yet; see [memory scheduling](memory-scheduling.md) |
 | `memory-reserve` | `"512M"` | memory kept free on every host |
+| `retries` | `0` | how many times to rerun a failing test; see [Retries](#retries) |
 | `overrides` | `[]` | per-test settings; see below |
 
 Other profiles inherit from `default`: a key they don't set takes the
@@ -84,9 +85,28 @@ Each override applies to the tests its `filter` matches.
 | `include-ignored` | also run these tests when they are `#[ignore]`d |
 | `timeout` | timeout for these tests |
 | `memory` | memory these tests need; wins over the measured peak |
+| `retries` | how many times to rerun these tests when they fail |
 
 When several overrides match a test, they apply in order: later values win,
 and `uses` lists are combined.
+
+## Retries
+
+```toml
+[profile.default]
+retries = 1                # every test may fail once
+
+[[profile.default.overrides]]
+filter = "binary(k8s)"
+retries = 3                # these may fail three times
+```
+
+A failed test is run again, up to `retries` more times, in the same slot. Each
+try gets fresh test-scoped fixtures, and each failed try is reported as
+`TRY n FAIL` with its output. A test that passes on a later try counts as
+passed, but is reported as `FLAKY` and listed in the summary. With
+`--keep-fixtures`, only the fixtures of the last failed try are kept.
+`--retries <N>` on the command line wins over the config.
 
 ## Fixtures: `[fixture.<name>]`
 
