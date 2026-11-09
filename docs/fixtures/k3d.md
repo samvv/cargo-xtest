@@ -23,7 +23,6 @@ uses = ["k8s"]
 
 | Key | Default | Meaning |
 |---|---|---|
-| `scope` | `"test"` | `test`, `binary` or `run`: how widely one cluster is shared. Clusters are slow to create, so `run` is usually best. |
 | `servers` | `1` | number of server (control-plane) nodes |
 | `agents` | `0` | number of agent (worker) nodes |
 | `image` | k3d's default | k3s image, e.g. `"rancher/k3s:v1.31.4-k3s1"` |
@@ -33,6 +32,10 @@ uses = ["k8s"]
 | `export` | `{}` | env vars for tests; values may use [templates](#templates) |
 | `runner` | none | `{ image = "..." }` or `{ build = { dockerfile = "...", context = "..." } }`: the container tests run in with `run-in` |
 | `network` | none | share a Docker network with other clusters; see [Networking between clusters](#networking-between-clusters) |
+
+Plus `kind` and `scope`, which every fixture has; see
+[configuration](../configuration.md#fixtures-fixturename). Clusters are slow to
+create, so `scope = "run"` is usually best.
 
 ## What tests get
 
@@ -47,7 +50,7 @@ uses = ["k8s"]
 | Used with | Where the test runs |
 |---|---|
 | `uses = ["k8s"]` | on the host, next to the cluster |
-| `run-in = "k8s"` | in the `runner` container: host network, sandbox at its original paths (see [environment containers](../internals.md#environment-containers)) |
+| `run-in = "k8s"` | in the `runner` container: host network, sandbox at its original paths (see [environment containers](docker.md#environment-containers)) |
 
 `run-in` with a k3d fixture that has no `runner` is rejected when the config
 is loaded.
@@ -126,4 +129,4 @@ agent dies, the next agent on that host deletes its leftover clusters and
 networks when it starts.
 
 Cached kubectl binaries are removed after 7 days without use, or by
-`cargo xtest clean`.
+`cargo xtest clean`; see [cleanup](../cleanup.md).

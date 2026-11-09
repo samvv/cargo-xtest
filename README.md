@@ -17,43 +17,30 @@ cargo xtest                               # in any workspace
 
 ## How it works
 
-1. Builds tests locally with `cargo test --no-run`.
-2. Uploads test binaries, executables and workspace files (respecting
-   `.gitignore`) to each host's content-addressed store. Blobs the host
-   already has are skipped.
-3. Each host gets a sandbox for the run. Tests see it at the **original
-   absolute paths** through a user + mount namespace (no root needed), so
-   `env!("CARGO_MANIFEST_DIR")` and `CARGO_BIN_EXE_*` keep working.
-4. Lists the tests and runs each one in its own process, spread over all
-   host slots.
-5. Fixtures are set up and torn down by the agent. If the controller dies,
-   the agent cleans up anyway; leftovers from a crashed agent are removed
-   on its next start.
+cargo-xtest builds your tests locally, uploads what changed to each host, and
+runs every test in its own process there. Tests see their files at the
+original paths, so `env!("CARGO_MANIFEST_DIR")` and `CARGO_BIN_EXE_*` keep
+working. Hosts only need SSH; the agent installs itself on first use. See
+[docs/internals.md](docs/internals.md) for the details.
 
-Hosts only need SSH (any login shell; commands run through `sh -c`). The agent installs itself on first use under
-`$XDG_CACHE_HOME/cargo-xtest` (default `~/.cache/cargo-xtest`).
+## Configuration
 
-## Configuration: `.config/xtest.toml`
+cargo-xtest reads `.config/xtest.toml` in the workspace root. Without it,
+tests run on this machine with no fixtures.
 
 ```toml
 [profile.default]
-target = "x86_64-unknown-linux-musl"   # optional
-include = ["tests/data/**"]            # extra files, even if gitignored
 timeout = "60s"
-memory = "256M"                        # assumed for tests not measured yet
-memory-reserve = "512M"                # kept free on every host
 
+# Tests in tests/db.rs get a Postgres container next to them.
 [[profile.default.overrides]]
-filter = "package(myapp) & test(=backup::tests::creates_archive)"
-run-in = "borg"            # environment: the test runs inside it
-uses = ["pg"]              # services: run next to the test
-include-ignored = true
-memory = "2G"              # wins over the measured peak
+filter = "binary(db)"
+uses = ["pg"]
 
-[fixture.borg]
-kind = "docker"
-build = { dockerfile = "tests/docker/borg.Dockerfile", context = "tests/docker" }
-scope = "test"             # test | binary | run
+# This test runs inside a container with borg installed.
+[[profile.default.overrides]]
+filter = "test(=backup::tests::creates_archive)"
+run-in = "borg"
 
 [fixture.pg]
 kind = "docker"
@@ -63,31 +50,20 @@ env = { POSTGRES_PASSWORD = "x" }
 ready = { cmd = ["pg_isready", "-U", "postgres"], timeout = "30s" }
 export = { DATABASE_URL = "postgres://postgres:x@{host}:{port:5432}/postgres" }
 
-[fixture.tmpstate]
-kind = "command"
-setup = "./scripts/up.sh"            # prints {"handle": "...", "env": {...}}
-teardown = "./scripts/down.sh {handle}"
+[fixture.borg]
+kind = "docker"
+build = { dockerfile = "tests/docker/borg.Dockerfile" }
 
 [[host]]
-name = "pi4"
-ssh = "ci@pi4.lan"
-slots = 4
-# root = "/data/xtest"               # agent data directory on the host
-# store-size = "10G"                 # cap on the blob store (default 10G)
+name = "build-box"
+ssh = "ci@build-box.lan"
 ```
 
-Without any `[[host]]`, tests run on this machine.
-
-More details:
-
-- [docs/internals.md](docs/internals.md): the filter syntax and how
-  environment containers work.
-- [docs/fixtures/k3d.md](docs/fixtures/k3d.md): Kubernetes clusters with k3d,
-  including several clusters and networking between them.
-- [docs/memory-scheduling.md](docs/memory-scheduling.md): how tests are
-  started only while they fit in free memory, and how their memory is measured.
-- [docs/cleanup.md](docs/cleanup.md): what agents clean up, the store size cap
-  and `cargo xtest clean`.
+The [documentation](docs/README.md) covers the rest:
+[every configuration key](docs/configuration.md), [filters](docs/filters.md),
+[fixtures](docs/fixtures/README.md) ([Docker](docs/fixtures/docker.md),
+[command](docs/fixtures/command.md), [k3d](docs/fixtures/k3d.md)),
+[memory scheduling](docs/memory-scheduling.md) and [cleanup](docs/cleanup.md).
 
 ## CLI
 
@@ -102,7 +78,7 @@ cargo xtest [OPTIONS] [FILTERS]...
 | Flag | Description |
 |---|---|
 | `FILTERS...` | Run only tests whose name contains one of these strings |
-| `-E`, `--filter-expr <EXPR>` | Run only tests matching this [filter expression](docs/internals.md#filters), e.g. `package(db) & test(/integration/)`. Repeatable: a test runs if any expression matches |
+| `-E`, `--filter-expr <EXPR>` | Run only tests matching this [filter expression](docs/filters.md), e.g. `package(db) & test(/integration/)`. Repeatable: a test runs if any expression matches |
 | `-p`, `--package <PKG>` | Test only this package. Repeatable |
 | `--workspace` | Test every package in the workspace |
 | `-F`, `--features <FEATURES>` | Comma-separated features to enable |
@@ -114,7 +90,7 @@ cargo xtest [OPTIONS] [FILTERS]...
 | `--host <NAME>` | Run only on this host. Repeatable |
 | `--ignored` | Run only ignored tests |
 | `--include-ignored` | Run ignored tests too |
-| `--keep-fixtures` | Keep the test-scoped fixtures of failed tests, and print how to inspect them (e.g. `docker exec -it ... sh`) |
+| `--keep-fixtures` | Keep the test-scoped fixtures of failed tests, and print how to inspect them (e.g. `docker exec -it ... sh`); see [fixtures](docs/fixtures/README.md#debugging---keep-fixtures) |
 | `--list` | List the tests that would run, with their memory estimates, then exit |
 | `--config <FILE>` | Config file to use instead of `.config/xtest.toml` in the workspace root |
 
@@ -140,12 +116,3 @@ cargo xtest clean [OPTIONS]
 
 Fixtures kept with `--keep-fixtures` can also be released one run at a time:
 delete the run's `keep` file under `<root>/runs/`, and the next run cleans it up.
-
-## Layout
-
-| Crate | Role |
-|---|---|
-| `crates/cargo-xtest` | CLI, config, build, scheduling, reporting |
-| `crates/xtest-agent` | Blob store, sandbox, process spawning, fixtures, cleanup |
-| `crates/xtest-proto` | Wire protocol (length-prefixed postcard frames) |
-| `examples/demo` | Workspace that exercises every feature |
