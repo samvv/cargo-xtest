@@ -1,6 +1,6 @@
 //! Discovering tests, setting up fixtures and spreading tests over hosts.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +16,7 @@ use crate::cargo::TestBinary;
 use crate::client::Agent;
 use crate::config::{format_size, Scope};
 use crate::files::FileSet;
+use crate::history::Measured;
 
 pub struct FixtureDef {
     pub scope: Scope,
@@ -54,6 +55,8 @@ pub struct Case {
     /// Estimated memory need in bytes.
     pub memory: u64,
     pub memory_source: MemorySource,
+    /// How long it took last time, if known.
+    pub expected: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -193,14 +196,20 @@ pub struct Ctx {
     pub keep_fixtures: bool,
     pub memory_reserve: u64,
     pub reporter: Reporter,
-    /// Peak memory measured in this run, by test.
-    pub measured: Mutex<BTreeMap<String, u64>>,
+    /// What this run measured, for the history.
+    pub measured: Mutex<Measured>,
 }
 
 impl Ctx {
     fn record(&self, host: &str, case: &Case, outcome: &Outcome) {
-        if let Some(peak) = outcome.peak_memory {
-            self.measured.lock().unwrap().insert(case.display(), peak);
+        {
+            let mut measured = self.measured.lock().unwrap();
+            if let Some(peak) = outcome.peak_memory {
+                measured.peaks.insert(case.display(), peak);
+            }
+            if let Some(d) = outcome.ran_for {
+                measured.durations.insert(case.display(), d);
+            }
         }
         self.reporter.report(host, case, outcome);
     }
@@ -208,7 +217,7 @@ impl Ctx {
     /// Records a fixture instance's peak; the history keeps the largest of this run.
     pub fn record_fixture(&self, name: &str, peak: u64) {
         let mut measured = self.measured.lock().unwrap();
-        let e = measured.entry(fixture_history_key(name)).or_insert(0);
+        let e = measured.peaks.entry(fixture_history_key(name)).or_insert(0);
         *e = (*e).max(peak);
     }
 }
@@ -300,10 +309,21 @@ fn fixtures_of(case: &Case) -> impl Iterator<Item = (&String, Role)> {
     case.run_in.iter().map(|n| (n, Role::Environment)).chain(case.uses.iter().map(|n| (n, Role::Service)))
 }
 
+/// Orders the queue: longest expected duration first, so a slow test doesn't
+/// start last and make the run longer than it needs to be. Tests without
+/// history count as the median of the known durations. Ties, and runs without
+/// any history, go biggest memory first: those are the hardest to fit once
+/// memory is shared out. The sort is stable, so equal tests keep their
+/// discovery order.
+pub fn order(cases: &mut [Case]) {
+    let mut known: Vec<Duration> = cases.iter().filter_map(|c| c.expected).collect();
+    known.sort();
+    let median = known.get(known.len() / 2).copied().unwrap_or_default();
+    cases.sort_by_key(|c| (std::cmp::Reverse(c.expected.unwrap_or(median)), std::cmp::Reverse(c.memory)));
+}
+
 pub async fn run_all(ctx: Arc<Ctx>, hosts: &[Arc<HostState>], mut cases: Vec<Case>) {
-    // Biggest first: they are the hardest to fit once memory is shared out.
-    // The sort is stable, so equal tests keep their discovery order.
-    cases.sort_by_key(|c| std::cmp::Reverse(c.memory));
+    order(&mut cases);
     let queue = Arc::new(Mutex::new(VecDeque::from(cases)));
     let mut set = JoinSet::new();
     for host in hosts {
@@ -408,6 +428,9 @@ async fn dispatch(ctx: Arc<Ctx>, host: Arc<HostState>, queue: Arc<Mutex<VecDeque
 pub struct Outcome {
     pub status: Status,
     pub duration: Duration,
+    /// How long the test process ran, if it ran to completion (not for
+    /// timeouts or failed fixture setups). Saved for ordering later runs.
+    pub ran_for: Option<Duration>,
     pub output: Vec<u8>,
     pub peak_memory: Option<u64>,
 }
@@ -444,6 +467,7 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, started
         Err(e) => Outcome {
             status: Status::Fail(format!("{e:#}")),
             duration: start.elapsed(),
+            ran_for: None,
             output: vec![],
             peak_memory: None,
         },
@@ -467,12 +491,14 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, started
                 Ok(r) => Outcome {
                     status: if r.exit.success() { Status::Pass } else { Status::Fail(r.exit.to_string()) },
                     duration: r.duration,
+                    ran_for: matches!(r.exit, Exit::Code(_) | Exit::Signal(_)).then_some(r.duration),
                     output: r.output,
                     peak_memory: r.peak_memory,
                 },
                 Err(e) => Outcome {
                     status: Status::Fail(format!("{e:#}")),
                     duration: start.elapsed(),
+                    ran_for: None,
                     output: vec![],
                     peak_memory: None,
                 },
@@ -583,5 +609,52 @@ impl Reporter {
             eprintln!("{} {f}", self.paint("1;31", &format!("{:>12}", "FAIL")));
         }
         c.failed.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn case(name: &str, memory: u64, expected: Option<u64>) -> Case {
+        let bin = TestBinary {
+            package: "p".into(),
+            version: "0.1.0".into(),
+            name: "p".into(),
+            kind: "lib".into(),
+            exe: "/p".into(),
+            manifest_dir: "/".into(),
+            harness: true,
+        };
+        Case {
+            bin: Arc::new(bin),
+            name: name.into(),
+            ignored: false,
+            run_in: None,
+            uses: vec![],
+            timeout: None,
+            memory,
+            memory_source: MemorySource::Default,
+            expected: expected.map(Duration::from_secs),
+        }
+    }
+
+    fn names(cases: &[Case]) -> Vec<&str> {
+        cases.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    #[test]
+    fn longest_first_with_unknown_tests_at_the_median() {
+        let mut cases = vec![case("a", 1, Some(1)), case("new", 1, None), case("b", 1, Some(30)), case("c", 1, Some(5))];
+        order(&mut cases);
+        // Known: 1, 5, 30 → median 5; the unknown test ties with `c` and keeps its place.
+        assert_eq!(names(&cases), ["b", "new", "c", "a"]);
+    }
+
+    #[test]
+    fn without_history_biggest_memory_first() {
+        let mut cases = vec![case("small", 1, None), case("big", 9, None), case("mid", 5, None)];
+        order(&mut cases);
+        assert_eq!(names(&cases), ["big", "mid", "small"]);
     }
 }

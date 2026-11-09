@@ -35,13 +35,32 @@ or as a local process) and talks to it over the agent's stdin and stdout.
    [Store and sandbox](#store-and-sandbox).
 6. **Discover.** Each test binary is run with `--list --format terse` (and
    `--ignored`) on the first host. A `harness = false` binary is one test.
-7. **Schedule.** Each host has a queue and runs tests while it has free
+7. **Schedule.** All hosts take tests from one queue, ordered longest first
+   (see [Test order](#test-order)). Each host starts tests while it has free
    slots and memory; see [memory scheduling](memory-scheduling.md).
 8. **Run.** Each test is its own process: `<binary> --exact <name>
    --nocapture`, with fixtures set up first if it needs them.
 9. **Shut down.** The controller sends `Shutdown`. The agent kills what is
    still running, tears down fixtures (except kept ones), and removes the run
    directory.
+
+## Test order
+
+The queue is ordered by how long each test took in the last run, longest
+first. A slow test that starts last makes the whole run as long as that
+test, so starting it first lets the short ones fill the other slots
+meanwhile. Tests without a recorded duration count as the median of the
+known durations. Ties, and runs without any history, go biggest memory
+first, since those tests are the hardest to fit later.
+
+Each host starts the first test in the queue that fits in its free memory,
+so the order is a preference, not a guarantee. `--list` prints tests in this
+order, with their expected durations.
+
+Durations and memory peaks are kept in `<target dir>/xtest/history.json`.
+A duration is the time the test process ran, not counting fixture setup. It
+isn't saved for tests that timed out, tests whose fixtures failed, or
+interrupted runs.
 
 ## Hash cache
 

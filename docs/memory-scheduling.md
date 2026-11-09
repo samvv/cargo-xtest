@@ -43,8 +43,9 @@ Running tests and fixtures that haven't reached their estimate yet still have
 that memory reserved. A test costs its own estimate plus the estimate of each
 fixture instance it would create, so a test whose run-scoped cluster already
 exists costs less than the first test that needs it. The controller starts
-the biggest queued test whose cost fits in `free`, and checks again every
-250 ms while tests are waiting.
+the first queued test whose cost fits in `free` (the queue is ordered
+[longest first](internals.md#test-order)), and checks again every 250 ms
+while tests are waiting.
 
 A host with nothing running always starts its next test, so a test bigger
 than any host still runs, with a warning.
@@ -54,7 +55,7 @@ than any host still runs, with a warning.
 A test's estimate is the first of:
 
 1. `memory` from a matching override;
-2. the peak measured in the last run, saved in `<target dir>/xtest/memory.json`;
+2. the peak measured in the last run, saved in `<target dir>/xtest/history.json`;
 3. the profile's `memory`.
 
 `--list` shows each test's estimate and where it came from. The report after

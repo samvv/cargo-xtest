@@ -75,7 +75,7 @@ struct Args {
     /// Keep fixtures of failed tests for debugging.
     #[arg(long)]
     keep_fixtures: bool,
-    /// List the tests that would run, then exit.
+    /// List the tests that would run, in the order they would start, then exit.
     #[arg(long)]
     list: bool,
     /// Hash every file again instead of trusting the hash cache.
@@ -243,11 +243,13 @@ fn run(args: Args) -> Result<ExitCode> {
                     timeout: profile.timeout,
                     memory: profile.memory,
                     memory_source: MemorySource::Default,
+                    expected: None,
                 };
-                if let Some(&peak) = history.peaks.get(&case.display()) {
+                if let Some(peak) = history.peak(&case.display()) {
                     case.memory = peak;
                     case.memory_source = MemorySource::Measured;
                 }
+                case.expected = history.duration(&case.display());
                 let mut include_ignored = args.include_ignored;
                 for (f, o) in &profile.overrides {
                     if f.matches(&subject) {
@@ -279,6 +281,8 @@ fn run(args: Args) -> Result<ExitCode> {
             }
 
             if args.list {
+                // In the order they would start.
+                runner::order(&mut cases);
                 let source = |s: MemorySource| match s {
                     MemorySource::Config => "config",
                     MemorySource::Measured => "measured",
@@ -286,6 +290,10 @@ fn run(args: Args) -> Result<ExitCode> {
                 };
                 for c in &cases {
                     let mut extra = format!(" [memory: {} ({})]", format_size(c.memory), source(c.memory_source));
+                    extra += &match c.expected {
+                        Some(d) => format!(" [duration: {:.1}s (measured)]", d.as_secs_f64()),
+                        None => " [duration: unknown]".to_string(),
+                    };
                     if let Some(e) = &c.run_in {
                         extra += &format!(" [run-in: {e}]");
                     }
@@ -337,6 +345,7 @@ fn run(args: Args) -> Result<ExitCode> {
                 .measured
                 .lock()
                 .unwrap()
+                .peaks
                 .iter()
                 .filter_map(|(k, v)| Some((k.strip_prefix("fixture:")?.to_string(), *v)))
                 .collect();
@@ -478,9 +487,9 @@ fn fixture_defs(
                 cwd: ws_root.to_owned(),
             }),
         };
-        let (memory, memory_source) = match (&f.memory, history.peaks.get(&runner::fixture_history_key(name))) {
+        let (memory, memory_source) = match (&f.memory, history.peak(&runner::fixture_history_key(name))) {
             (Some(m), _) => (config::parse_size(m)?, MemorySource::Config),
-            (None, Some(&peak)) => (peak, MemorySource::Measured),
+            (None, Some(peak)) => (peak, MemorySource::Measured),
             (None, None) => (default_fixture_memory(f), MemorySource::Default),
         };
         out.insert(name.clone(), FixtureDef { scope: f.scope, spec, memory, memory_source });
