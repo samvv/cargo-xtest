@@ -361,6 +361,7 @@ fn fixture_defs(cfg: &Config, ws_root: &std::path::Path, files: &files::FileSet)
                     }),
                 },
                 export: f.export.clone(),
+                network: f.network.clone(),
                 runner: match &f.runner {
                     Some(r) => Some(image_source(&format!("{name}-runner"), r.image.as_ref(), r.build.as_ref(), ws_root, files)?),
                     None => None,

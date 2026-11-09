@@ -350,7 +350,15 @@ impl Session {
         let mut path = Vec::new();
         for id in leases {
             let l = state.leases.get(id).with_context(|| format!("unknown lease {id}"))?;
-            env.extend(l.env.clone());
+            for (k, v) in &l.env {
+                match env.get_mut(k) {
+                    // Several clusters: kubectl reads every file in the list.
+                    Some(prev) if k == "KUBECONFIG" => *prev = format!("{prev}:{v}"),
+                    _ => {
+                        env.insert(k.clone(), v.clone());
+                    }
+                }
+            }
             path.extend(l.path.iter().map(|p| p.display().to_string()));
             if let Some(c) = &l.container {
                 if container.replace(c.clone()).is_some() {
@@ -466,6 +474,9 @@ impl Session {
             } else {
                 fixtures::teardown(self, lease).await;
             }
+        }
+        if self.docker {
+            fixtures::remove_networks(self).await;
         }
         if kept {
             let _ = fs::write(

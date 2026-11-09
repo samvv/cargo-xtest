@@ -1,5 +1,6 @@
 //! Removes what earlier agents left behind: run directories whose lock is no
-//! longer held, and containers labeled with a run that no longer exists.
+//! longer held, and containers, k3d clusters and networks labeled with a run
+//! that no longer exists.
 
 use std::fs::{self, File};
 use std::os::unix::io::AsRawFd;
@@ -45,6 +46,7 @@ pub fn collect(root: &Path, docker: bool) {
         // k3d first: deleting a cluster properly also removes its network
         // and volumes, which force-removing its containers would leave behind.
         collect_k3d(root, &dead);
+        collect_networks(root, &dead);
         let out = Command::new("docker")
             .args(["ps", "-a", "--filter"])
             .arg(format!("label=xtest.root={}", root.display()))
@@ -88,6 +90,23 @@ fn collect_k3d(root: &Path, dead: &dyn Fn(&str) -> bool) {
     for c in clusters {
         if Command::new("k3d").args(["cluster", "delete", &c]).output().is_err() {
             eprintln!("xtest-agent: k3d cluster {c} is left over, but k3d is not installed");
+        }
+    }
+}
+
+/// Shared networks of dead runs (after their clusters are deleted).
+fn collect_networks(root: &Path, dead: &dyn Fn(&str) -> bool) {
+    let out = Command::new("docker")
+        .args(["network", "ls", "--filter"])
+        .arg(format!("label=xtest.root={}", root.display()))
+        .args(["--format", "{{.Name}} {{.Label \"xtest.run\"}}"])
+        .output();
+    let Ok(out) = out else { return };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some((name, run)) = line.split_once(' ') {
+            if dead(run) {
+                let _ = Command::new("docker").args(["network", "rm", name]).output();
+            }
         }
     }
 }

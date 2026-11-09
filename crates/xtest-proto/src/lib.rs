@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped whenever the messages below change incompatibly.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// Largest frame we accept. Blob uploads are chunked well below this.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -144,14 +144,21 @@ pub struct K3dSpec {
     pub args: Vec<String>,
     /// How long `k3d cluster create --wait` may take.
     pub timeout: Duration,
-    /// Run on the host until it succeeds; may use `{cluster}` and `{kubeconfig}`.
+    /// Run on the host until it succeeds. May use the templates in [`K3D_TEMPLATES`].
     pub ready: Option<Ready>,
-    /// Env vars exported to tests; may use `{cluster}` and `{kubeconfig}`.
+    /// Env vars exported to tests. May use the templates in [`K3D_TEMPLATES`].
     pub export: BTreeMap<String, String>,
+    /// Docker network shared by every k3d fixture of the run with the same
+    /// name, so their nodes can reach each other (e.g. through NodePorts).
+    pub network: Option<String>,
     /// Image of the container tests run in when the cluster is their
     /// environment (`run-in`).
     pub runner: Option<ImageSource>,
 }
+
+/// Templates k3d fixtures can use in `ready` and `export`.
+pub const K3D_TEMPLATES: &[&str] =
+    &["{cluster}", "{context}", "{kubeconfig}", "{network}", "{server-ip}", "{server:N}", "{agent:N}"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DockerSpec {

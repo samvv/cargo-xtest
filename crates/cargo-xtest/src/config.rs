@@ -92,6 +92,8 @@ pub struct Fixture {
     pub timeout: Option<String>,
     /// Container tests run in when a k3d cluster is their environment.
     pub runner: Option<RunnerCfg>,
+    /// Docker network shared with other k3d fixtures that name the same one.
+    pub network: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,6 +121,7 @@ impl Fixture {
         add(!self.args.is_empty(), "args");
         add(self.timeout.is_some(), "timeout");
         add(self.runner.is_some(), "runner");
+        add(self.network.is_some(), "network");
         f
     }
 }
@@ -201,7 +204,7 @@ impl Config {
             let allowed: &[&str] = match f.kind {
                 FixtureKind::Docker => &["image", "build", "env", "ports", "ready", "export"],
                 FixtureKind::Command => &["setup", "teardown"],
-                FixtureKind::K3d => &["image", "servers", "agents", "args", "timeout", "ready", "export", "runner"],
+                FixtureKind::K3d => &["image", "servers", "agents", "args", "timeout", "ready", "export", "runner", "network"],
             };
             if let Some(bad) = f.set_fields().into_iter().find(|x| !allowed.contains(x)) {
                 bail!("fixture `{name}`: `{bad}` is not supported by {:?} fixtures", f.kind);
@@ -223,6 +226,12 @@ impl Config {
                     }
                 }
                 FixtureKind::K3d => {
+                    if let Some(n) = &f.network {
+                        let ok = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+                        if n.is_empty() || n.len() > 32 || !n.chars().all(ok) {
+                            bail!("fixture `{name}`: `network` must be 1-32 letters, digits, `-` or `_`");
+                        }
+                    }
                     if let Some(r) = &f.runner {
                         if r.image.is_some() == r.build.is_some() {
                             bail!("fixture `{name}`: set exactly one of `runner.image` or `runner.build`");

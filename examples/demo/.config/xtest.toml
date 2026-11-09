@@ -43,6 +43,12 @@ filter = "binary(k8s_env)"
 run-in = "k8s"
 include-ignored = true
 
+[[profile.k8s.overrides]]
+filter = "binary(k8s_mesh)"
+uses = ["mesh-a", "mesh-b"]
+timeout = "5m"
+include-ignored = true
+
 [fixture.k8s]
 kind = "k3d"
 scope = "run"
@@ -52,3 +58,18 @@ ready = { cmd = "kubectl wait --for=condition=Ready nodes --all --timeout=10s", 
 export = { K3D_CLUSTER = "{cluster}" }
 # Used with `run-in`: tests run in this container, with KUBECONFIG and kubectl.
 runner = { image = "archlinux:latest" }
+
+# Two clusters on one docker network, so their nodes can reach each other.
+[fixture.mesh-a]
+kind = "k3d"
+scope = "run"
+network = "mesh"
+args = ["--no-lb"]
+export = { A_CONTEXT = "{context}", A_SERVER_IP = "{server-ip}" }
+
+[fixture.mesh-b]
+kind = "k3d"
+scope = "run"
+network = "mesh"
+args = ["--no-lb"]
+export = { B_CONTEXT = "{context}", B_SERVER_IP = "{server-ip}" }

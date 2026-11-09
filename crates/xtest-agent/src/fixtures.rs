@@ -1,4 +1,4 @@
-//! Fixture kinds: Docker containers and user-supplied commands.
+//! Fixture kinds: Docker containers, k3d clusters and user-supplied commands.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -113,7 +113,7 @@ async fn k3d_setup(
     }
     let cluster = k3d_cluster_name(&s.run_id, id);
     let kubeconfig = s.run_dir.join("tmp").join(format!("kubeconfig-{id}.yaml"));
-    let fill = |t: &str| t.replace("{cluster}", &cluster).replace("{kubeconfig}", &kubeconfig.display().to_string());
+    let network = k.network.as_ref().map(|n| k3d_network_name(&s.run_id, n));
 
     let mut args: Vec<String> = vec![
         "cluster".into(),
@@ -132,23 +132,33 @@ async fn k3d_setup(
     if let Some(image) = &k.image {
         args.extend(["--image".into(), image.clone()]);
     }
+    if let Some(net) = &network {
+        args.extend(["--network".into(), net.clone()]);
+    }
     // Labels on the server nodes let the agent find leftover clusters later.
     for label in [format!("xtest.run={}", s.run_id), format!("xtest.root={}", s.root.display())] {
         args.extend(["--runtime-label".into(), format!("{label}@server:*")]);
     }
     args.extend(k.args.iter().cloned());
 
-    let created = tool("k3d", &args).await.context("creating k3d cluster");
+    let created = async {
+        if let Some(net) = &network {
+            ensure_network(s, net).await.context("creating the shared network")?;
+        }
+        tool("k3d", &args).await.context("creating k3d cluster")
+    }
+    .await;
     let mut runner: Option<Container> = None;
     let ready = async {
         created?;
         let config = tool("k3d", ["kubeconfig", "get", &cluster]).await?;
         std::fs::write(&kubeconfig, config)?;
+        let vars = k3d_vars(&cluster, &kubeconfig, network.as_deref()).await.context("looking up the nodes")?;
         let bin = provide_kubectl(s, &cluster, id).await.context("providing kubectl")?;
         let env = BTreeMap::from([("KUBECONFIG".to_string(), kubeconfig.display().to_string())]);
         let lease = Lease { kind: LeaseKind::K3d { cluster: cluster.clone(), runner: None }, env, container: None, path: vec![bin] };
         if let Some(r) = &k.ready {
-            let cmd: Vec<String> = r.cmd.iter().flatten().map(|a| fill(a)).collect();
+            let cmd: Vec<String> = r.cmd.iter().flatten().map(|a| fill(a, &vars)).collect::<Result<_>>()?;
             let mut env = lease.env.clone();
             // Same PATH the tests get, so the ready command can use kubectl.
             let path = std::env::var("PATH").unwrap_or_default();
@@ -159,12 +169,15 @@ async fn k3d_setup(
             let image = ensure_image(s, image).await.context("runner image")?;
             runner = Some(start_environment(s, id, fixture, &image, &BTreeMap::new(), exclusive).await?);
         }
+        let mut lease = lease;
+        for (name, v) in &k.export {
+            lease.env.insert(name.clone(), fill(v, &vars).with_context(|| format!("in export `{name}`"))?);
+        }
         anyhow::Ok(lease)
     }
     .await;
     match ready {
         Ok(mut lease) => {
-            lease.env.extend(k.export.iter().map(|(name, v)| (name.clone(), fill(v))));
             let hint = match &runner {
                 Some(c) => format!("docker exec -it {} sh", c.name),
                 None => format!("KUBECONFIG={} {}/kubectl get pods -A", kubeconfig.display(), lease.path[0].display()),
@@ -181,6 +194,99 @@ async fn k3d_setup(
             Err(e)
         }
     }
+}
+
+/// Name of the docker network that k3d fixtures naming `network = name` share.
+pub fn k3d_network_name(run_id: &str, name: &str) -> String {
+    format!("xt-{run_id}-{name}")
+}
+
+/// Creates a run's shared network unless another fixture already did. It is
+/// removed when the session ends (see [`remove_networks`]).
+async fn ensure_network(s: &Session, name: &str) -> Result<()> {
+    if docker(["network", "inspect", name]).await.is_ok() {
+        return Ok(());
+    }
+    let labels = [format!("xtest.run={}", s.run_id), format!("xtest.root={}", s.root.display())];
+    let mut args = vec!["network".to_string(), "create".into()];
+    for l in labels {
+        args.extend(["--label".into(), l]);
+    }
+    args.push(name.into());
+    match docker(&args).await {
+        // Another cluster may have created it at the same moment.
+        Err(_) if docker(["network", "inspect", name]).await.is_ok() => Ok(()),
+        r => r.map(drop),
+    }
+}
+
+/// Removes the run's shared networks. One still used by a kept cluster
+/// can't be removed; garbage collection takes it later.
+pub async fn remove_networks(s: &Session) {
+    let Ok(ids) = docker(["network", "ls", "-q", "--filter", &format!("label=xtest.run={}", s.run_id)]).await else {
+        return;
+    };
+    for id in ids.split_whitespace() {
+        let _ = docker(["network", "rm", id]).await;
+    }
+}
+
+/// Values for the k3d templates: names, paths and node IPs on the cluster's network.
+async fn k3d_vars(cluster: &str, kubeconfig: &Path, network: Option<&str>) -> Result<BTreeMap<String, String>> {
+    let net = network.map(String::from).unwrap_or_else(|| format!("k3d-{cluster}"));
+    let mut vars = BTreeMap::from([
+        ("cluster".to_string(), cluster.to_string()),
+        ("context".to_string(), format!("k3d-{cluster}")),
+        ("kubeconfig".to_string(), kubeconfig.display().to_string()),
+        ("network".to_string(), net.clone()),
+    ]);
+    let out = docker(["network", "inspect", &net, "-f", "{{range .Containers}}{{.Name}}={{.IPv4Address}} {{end}}"]).await?;
+    for entry in out.split_whitespace() {
+        let Some((name, addr)) = entry.split_once('=') else { continue };
+        let ip = addr.split('/').next().unwrap_or(addr);
+        let Some(node) = name.strip_prefix(&format!("k3d-{cluster}-")) else { continue };
+        for role in ["server", "agent"] {
+            if let Some(n) = node.strip_prefix(&format!("{role}-")) {
+                vars.insert(format!("{role}:{n}"), ip.to_string());
+            }
+        }
+    }
+    if let Some(ip) = vars.get("server:0").cloned() {
+        vars.insert("server-ip".into(), ip);
+    }
+    Ok(vars)
+}
+
+/// Fills `{name}` templates from `vars`. A template that looks like ours
+/// but has no value (e.g. `{agent:3}` with one agent) is an error; other
+/// braces (such as shell `${X}`) are left alone.
+fn fill(text: &str, vars: &BTreeMap<String, String>) -> Result<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let key = after.find('}').map(|end| &after[..end]);
+        match key.and_then(|k| vars.get(k).map(|v| (k, v))) {
+            Some((k, v)) => {
+                out.push_str(v);
+                rest = &after[k.len() + 1..];
+            }
+            None => {
+                let k = key.unwrap_or("");
+                let ours = ["cluster", "context", "kubeconfig", "network", "server-ip"].contains(&k)
+                    || k.starts_with("server:")
+                    || k.starts_with("agent:");
+                if ours {
+                    bail!("`{{{k}}}` has no value: this cluster has no such node");
+                }
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Makes `kubectl` available from the cluster itself: the k3s binary in the
@@ -468,5 +574,17 @@ mod tests {
     #[test]
     fn quotes_for_shell() {
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn fills_k3d_templates() {
+        let vars = BTreeMap::from([
+            ("cluster".to_string(), "xt1-r".to_string()),
+            ("server-ip".to_string(), "172.18.0.2".to_string()),
+            ("server:0".to_string(), "172.18.0.2".to_string()),
+        ]);
+        assert_eq!(fill("http://{server-ip}:30080/{cluster}", &vars).unwrap(), "http://172.18.0.2:30080/xt1-r");
+        assert_eq!(fill("${HOME}/{x} {", &vars).unwrap(), "${HOME}/{x} {");
+        assert!(fill("{agent:0}", &vars).unwrap_err().to_string().contains("no such node"));
     }
 }
