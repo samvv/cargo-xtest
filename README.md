@@ -10,10 +10,27 @@ such as Docker containers.
 - **Isolation:** one process per test, with its own temp directory and timeout.
 - **Self-cleaning:** removes leftovers after crashes and keeps caches under a size cap.
 
+## Installation
+
 ```
-cargo install --path crates/cargo-xtest   # installs cargo-xtest and xtest-agent
-cargo xtest                               # in any workspace
+cargo install --git https://github.com/samvv/cargo-xtest cargo-xtest
 ```
+
+This installs two binaries into `~/.cargo/bin`: `cargo-xtest` and
+`xtest-agent`. Keep them together: cargo-xtest copies its own agent to each
+host. From a checkout, use `cargo install --path crates/cargo-xtest`.
+
+Then run `cargo xtest` in any Cargo workspace.
+
+**Requirements:**
+
+- **Your machine:** Linux, with Rust and Cargo.
+- **Test hosts:** Linux, reachable with `ssh` without a password prompt.
+  Nothing needs to be installed there. A host needs the same architecture as
+  your machine, and a glibc at least as new as yours. It also needs user
+  namespaces, so tests can see their files at the original paths.
+- **For fixtures:** Docker on the host for [Docker fixtures](docs/fixtures/docker.md),
+  plus `k3d` for [k3d fixtures](docs/fixtures/k3d.md).
 
 ## How it works
 
