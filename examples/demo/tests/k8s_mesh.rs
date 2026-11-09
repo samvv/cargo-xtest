@@ -19,6 +19,7 @@ fn both_clusters_are_in_kubeconfig() {
     let (a, b) = (var("A_CONTEXT"), var("B_CONTEXT"));
     // KUBECONFIG lists both files, so kubectl knows both contexts.
     let out = Command::new("kubectl").args(["config", "get-contexts", "-o", "name"]).output().unwrap();
+    assert!(out.status.success(), "kubectl config get-contexts: {}", String::from_utf8_lossy(&out.stderr));
     let contexts = String::from_utf8_lossy(&out.stdout);
     assert!(contexts.contains(&a) && contexts.contains(&b), "{contexts}");
 }

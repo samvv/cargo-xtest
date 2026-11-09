@@ -136,7 +136,7 @@ async fn k3d_setup(
         args.extend(["--network".into(), net.clone()]);
     }
     // Labels on the server nodes let the agent find leftover clusters later.
-    for label in [format!("xtest.run={}", s.run_id), format!("xtest.root={}", s.root.display())] {
+    for label in run_labels(s) {
         args.extend(["--runtime-label".into(), format!("{label}@server:*")]);
     }
     args.extend(k.args.iter().cloned());
@@ -153,7 +153,7 @@ async fn k3d_setup(
         created?;
         let config = tool("k3d", ["kubeconfig", "get", &cluster]).await?;
         std::fs::write(&kubeconfig, config)?;
-        let vars = k3d_vars(&cluster, &kubeconfig, network.as_deref()).await.context("looking up the nodes")?;
+        let vars = k3d_vars(&cluster, &kubeconfig, network.as_deref()).await;
         let bin = provide_kubectl(s, &cluster, id).await.context("providing kubectl")?;
         let env = BTreeMap::from([("KUBECONFIG".to_string(), kubeconfig.display().to_string())]);
         let lease = Lease { kind: LeaseKind::K3d { cluster: cluster.clone(), runner: None }, env, container: None, path: vec![bin] };
@@ -207,9 +207,8 @@ async fn ensure_network(s: &Session, name: &str) -> Result<()> {
     if docker(["network", "inspect", name]).await.is_ok() {
         return Ok(());
     }
-    let labels = [format!("xtest.run={}", s.run_id), format!("xtest.root={}", s.root.display())];
     let mut args = vec!["network".to_string(), "create".into()];
-    for l in labels {
+    for l in run_labels(s) {
         args.extend(["--label".into(), l]);
     }
     args.push(name.into());
@@ -231,54 +230,83 @@ pub async fn remove_networks(s: &Session) {
     }
 }
 
-/// Values for the k3d templates: names, paths and node IPs on the cluster's network.
-async fn k3d_vars(cluster: &str, kubeconfig: &Path, network: Option<&str>) -> Result<BTreeMap<String, String>> {
+/// Values for k3d templates, and why node IPs are missing if they are.
+struct Vars {
+    values: BTreeMap<String, String>,
+    nodes_error: Option<String>,
+}
+
+/// Values for the k3d templates: names, paths and node IPs on the cluster's
+/// network. Failing to look up IPs (e.g. the cluster uses a network of its own
+/// via `args`) is only an error once a template needs them.
+async fn k3d_vars(cluster: &str, kubeconfig: &Path, network: Option<&str>) -> Vars {
     let net = network.map(String::from).unwrap_or_else(|| format!("k3d-{cluster}"));
-    let mut vars = BTreeMap::from([
+    let mut values = BTreeMap::from([
         ("cluster".to_string(), cluster.to_string()),
         ("context".to_string(), format!("k3d-{cluster}")),
         ("kubeconfig".to_string(), kubeconfig.display().to_string()),
         ("network".to_string(), net.clone()),
     ]);
-    let out = docker(["network", "inspect", &net, "-f", "{{range .Containers}}{{.Name}}={{.IPv4Address}} {{end}}"]).await?;
-    for entry in out.split_whitespace() {
-        let Some((name, addr)) = entry.split_once('=') else { continue };
-        let ip = addr.split('/').next().unwrap_or(addr);
-        let Some(node) = name.strip_prefix(&format!("k3d-{cluster}-")) else { continue };
-        for role in ["server", "agent"] {
-            if let Some(n) = node.strip_prefix(&format!("{role}-")) {
-                vars.insert(format!("{role}:{n}"), ip.to_string());
+    let out = docker(["network", "inspect", &net, "-f", "{{range .Containers}}{{.Name}}={{.IPv4Address}} {{end}}"]).await;
+    let nodes_error = match out {
+        Err(e) => Some(format!("could not look up node IPs on network `{net}`: {e:#}")),
+        Ok(out) => {
+            for entry in out.split_whitespace() {
+                let Some((name, addr)) = entry.split_once('=') else { continue };
+                let ip = addr.split('/').next().unwrap_or_default();
+                let Some(node) = name.strip_prefix(&format!("k3d-{cluster}-")) else { continue };
+                if ip.is_empty() {
+                    continue; // no IPv4 address (e.g. an IPv6-only network)
+                }
+                for role in ["server", "agent"] {
+                    if let Some(n) = node.strip_prefix(&format!("{role}-")) {
+                        values.insert(format!("{role}:{n}"), ip.to_string());
+                    }
+                }
             }
+            if let Some(ip) = values.get("server:0").cloned() {
+                values.insert("server-ip".into(), ip);
+            }
+            None
         }
-    }
-    if let Some(ip) = vars.get("server:0").cloned() {
-        vars.insert("server-ip".into(), ip);
-    }
-    Ok(vars)
+    };
+    Vars { values, nodes_error }
 }
 
-/// Fills `{name}` templates from `vars`. A template that looks like ours
-/// but has no value (e.g. `{agent:3}` with one agent) is an error; other
-/// braces (such as shell `${X}`) are left alone.
-fn fill(text: &str, vars: &BTreeMap<String, String>) -> Result<String> {
+/// Whether `key` (without braces) is one of [`K3D_TEMPLATES`]; `N` stands for digits.
+fn is_k3d_template(key: &str) -> bool {
+    K3D_TEMPLATES.iter().any(|t| {
+        let t = &t[1..t.len() - 1];
+        match t.strip_suffix('N') {
+            Some(prefix) => key
+                .strip_prefix(prefix)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+            None => key == t,
+        }
+    })
+}
+
+/// Fills `{name}` templates. A template without a value (e.g. `{agent:3}`
+/// with one agent) is an error; other braces, such as shell `${X}` or
+/// literal JSON, are left alone.
+fn fill(text: &str, vars: &Vars) -> Result<String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find('{') {
         out.push_str(&rest[..start]);
         let after = &rest[start + 1..];
         let key = after.find('}').map(|end| &after[..end]);
-        match key.and_then(|k| vars.get(k).map(|v| (k, v))) {
+        match key.and_then(|k| vars.values.get(k).map(|v| (k, v))) {
             Some((k, v)) => {
                 out.push_str(v);
                 rest = &after[k.len() + 1..];
             }
             None => {
-                let k = key.unwrap_or("");
-                let ours = ["cluster", "context", "kubeconfig", "network", "server-ip"].contains(&k)
-                    || k.starts_with("server:")
-                    || k.starts_with("agent:");
-                if ours {
-                    bail!("`{{{k}}}` has no value: this cluster has no such node");
+                if let Some(k) = key.filter(|k| is_k3d_template(k)) {
+                    match &vars.nodes_error {
+                        Some(e) => bail!("`{{{k}}}` has no value: {e}"),
+                        None => bail!("`{{{k}}}` has no value: this cluster has no such node with an IPv4 address"),
+                    }
                 }
                 out.push('{');
                 rest = after;
@@ -355,15 +383,17 @@ async fn ensure_image(s: &Session, image: &ImageSource) -> Result<String> {
     })
 }
 
+/// Labels that tie docker objects to this run, so GC can find leftovers.
+fn run_labels(s: &Session) -> [String; 2] {
+    [format!("xtest.run={}", s.run_id), format!("xtest.root={}", s.root.display())]
+}
+
 fn labels(s: &Session, fixture: &str) -> Vec<String> {
-    [
-        format!("xtest.run={}", s.run_id),
-        format!("xtest.root={}", s.root.display()),
-        format!("xtest.fixture={fixture}"),
-    ]
-    .into_iter()
-    .flat_map(|l| ["--label".to_string(), l])
-    .collect()
+    let [run, root] = run_labels(s);
+    [run, root, format!("xtest.fixture={fixture}")]
+        .into_iter()
+        .flat_map(|l| ["--label".to_string(), l])
+        .collect()
 }
 
 /// Starts a container that tests run in: as the agent's uid, on the host
@@ -578,13 +608,20 @@ mod tests {
 
     #[test]
     fn fills_k3d_templates() {
-        let vars = BTreeMap::from([
+        let values = BTreeMap::from([
             ("cluster".to_string(), "xt1-r".to_string()),
             ("server-ip".to_string(), "172.18.0.2".to_string()),
             ("server:0".to_string(), "172.18.0.2".to_string()),
         ]);
+        let vars = Vars { values, nodes_error: None };
         assert_eq!(fill("http://{server-ip}:30080/{cluster}", &vars).unwrap(), "http://172.18.0.2:30080/xt1-r");
         assert_eq!(fill("${HOME}/{x} {", &vars).unwrap(), "${HOME}/{x} {");
+        // Literal braces that only look a bit like templates stay as they are.
+        assert_eq!(fill("{server: x} {agent:} {agent:a}", &vars).unwrap(), "{server: x} {agent:} {agent:a}");
         assert!(fill("{agent:0}", &vars).unwrap_err().to_string().contains("no such node"));
+
+        let vars = Vars { values: BTreeMap::new(), nodes_error: Some("lookup failed".into()) };
+        assert!(fill("{server-ip}", &vars).unwrap_err().to_string().contains("lookup failed"));
+        assert_eq!(fill("no templates", &vars).unwrap(), "no templates");
     }
 }

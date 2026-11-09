@@ -345,15 +345,20 @@ impl Session {
         base: &BTreeMap<String, String>,
     ) -> Result<(BTreeMap<String, String>, Option<Container>)> {
         let state = self.state.lock().unwrap();
-        let mut env = BTreeMap::new();
+        let mut env: BTreeMap<String, String> = BTreeMap::new();
         let mut container: Option<Container> = None;
         let mut path = Vec::new();
-        for id in leases {
+        let mut seen = std::collections::HashSet::new();
+        for id in leases.iter().filter(|id| seen.insert(**id)) {
             let l = state.leases.get(id).with_context(|| format!("unknown lease {id}"))?;
             for (k, v) in &l.env {
                 match env.get_mut(k) {
                     // Several clusters: kubectl reads every file in the list.
-                    Some(prev) if k == "KUBECONFIG" => *prev = format!("{prev}:{v}"),
+                    Some(prev) if k == "KUBECONFIG" => {
+                        if !prev.split(':').any(|p| p == v) {
+                            *prev = format!("{prev}:{v}");
+                        }
+                    }
                     _ => {
                         env.insert(k.clone(), v.clone());
                     }
