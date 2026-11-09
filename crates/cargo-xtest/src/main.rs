@@ -329,35 +329,7 @@ fn fixture_defs(cfg: &Config, ws_root: &std::path::Path, files: &files::FileSet)
     for (name, f) in &cfg.fixture {
         let spec = match f.kind {
             FixtureKind::Docker => {
-                let image = match (&f.image, &f.build) {
-                    (Some(i), _) => ImageSource::Pull(i.clone()),
-                    (None, Some(b)) => {
-                        let dockerfile = ws_root.join(&b.dockerfile);
-                        let context = ws_root.join(b.context.clone().unwrap_or_else(|| {
-                            b.dockerfile.parent().map(|p| p.to_owned()).unwrap_or_default()
-                        }));
-                        let df = files.files.get(&dockerfile).with_context(|| {
-                            format!("fixture `{name}`: {} is not synced (missing or gitignored?)", dockerfile.display())
-                        })?;
-                        let mut h = Sha256::new();
-                        h.update(df.hash.0);
-                        for (p, e) in files.files.range(context.clone()..) {
-                            if !p.starts_with(&context) {
-                                break;
-                            }
-                            h.update(p.strip_prefix(&context).unwrap().as_os_str().as_encoded_bytes());
-                            h.update(e.hash.0);
-                        }
-                        let digest = hex::encode(h.finalize());
-                        let repo: String = name
-                            .to_lowercase()
-                            .chars()
-                            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
-                            .collect();
-                        ImageSource::Build { dockerfile, context, tag: format!("xtest/{repo}:{}", &digest[..16]) }
-                    }
-                    (None, None) => unreachable!("validated"),
-                };
+                let image = image_source(name, f.image.as_ref(), f.build.as_ref(), ws_root, files)?;
                 let mut ports = f.ports.clone();
                 for v in f.export.values() {
                     for c in port_re.captures_iter(v) {
@@ -389,6 +361,10 @@ fn fixture_defs(cfg: &Config, ws_root: &std::path::Path, files: &files::FileSet)
                     }),
                 },
                 export: f.export.clone(),
+                runner: match &f.runner {
+                    Some(r) => Some(image_source(&format!("{name}-runner"), r.image.as_ref(), r.build.as_ref(), ws_root, files)?),
+                    None => None,
+                },
             }),
             FixtureKind::Command => FixtureSpec::Command(CommandSpec {
                 setup: f.setup.clone().unwrap(),
@@ -399,4 +375,41 @@ fn fixture_defs(cfg: &Config, ws_root: &std::path::Path, files: &files::FileSet)
         out.insert(name.clone(), FixtureDef { scope: f.scope, spec });
     }
     Ok(out)
+}
+
+/// An image to pull, or one to build from a Dockerfile in the workspace.
+/// Built images are tagged with a hash of the Dockerfile and its context.
+fn image_source(
+    name: &str,
+    image: Option<&String>,
+    build: Option<&config::BuildCfg>,
+    ws_root: &std::path::Path,
+    files: &files::FileSet,
+) -> Result<ImageSource> {
+    let b = match (image, build) {
+        (Some(i), _) => return Ok(ImageSource::Pull(i.clone())),
+        (None, Some(b)) => b,
+        (None, None) => bail!("fixture `{name}`: set `image` or `build`"),
+    };
+    let dockerfile = ws_root.join(&b.dockerfile);
+    let context = ws_root.join(b.context.clone().unwrap_or_else(|| b.dockerfile.parent().map(|p| p.to_owned()).unwrap_or_default()));
+    let df = files.files.get(&dockerfile).with_context(|| {
+        format!("fixture `{name}`: {} is not synced (missing or gitignored?)", dockerfile.display())
+    })?;
+    let mut h = Sha256::new();
+    h.update(df.hash.0);
+    for (p, e) in files.files.range(context.clone()..) {
+        if !p.starts_with(&context) {
+            break;
+        }
+        h.update(p.strip_prefix(&context).unwrap().as_os_str().as_encoded_bytes());
+        h.update(e.hash.0);
+    }
+    let digest = hex::encode(h.finalize());
+    let repo: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        .collect();
+    Ok(ImageSource::Build { dockerfile, context, tag: format!("xtest/{repo}:{}", &digest[..16]) })
 }

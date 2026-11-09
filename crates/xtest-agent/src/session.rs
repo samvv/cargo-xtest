@@ -54,6 +54,9 @@ pub struct Lease {
     pub env: BTreeMap<String, String>,
     /// Set for environment leases: processes using it run in this container.
     pub container: Option<Container>,
+    /// Directories put in front of `PATH` (they must be visible in
+    /// environment containers too, so they live under the run's tmp dir).
+    pub path: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -62,12 +65,14 @@ pub struct Container {
     pub cgroup: Option<PathBuf>,
     /// Only one test uses it, so the container's peak is that test's peak.
     pub exclusive: bool,
+    /// `PATH` inside the container, so leases can extend it.
+    pub path: String,
 }
 
 pub enum LeaseKind {
     Container(String),
-    /// A k3d cluster, by name.
-    K3d(String),
+    /// A k3d cluster, and the runner container tests use it from (environment role).
+    K3d { cluster: String, runner: Option<String> },
     Command { teardown: Option<String>, cwd: PathBuf },
 }
 
@@ -332,18 +337,34 @@ impl Session {
         cmd
     }
 
-    fn lease_env(&self, leases: &[u64]) -> Result<(BTreeMap<String, String>, Option<Container>)> {
+    /// The env vars and environment container for a process using `leases`.
+    /// `base` is the process's own env, used to extend `PATH`.
+    pub fn lease_env(
+        &self,
+        leases: &[u64],
+        base: &BTreeMap<String, String>,
+    ) -> Result<(BTreeMap<String, String>, Option<Container>)> {
         let state = self.state.lock().unwrap();
         let mut env = BTreeMap::new();
-        let mut container = None;
+        let mut container: Option<Container> = None;
+        let mut path = Vec::new();
         for id in leases {
             let l = state.leases.get(id).with_context(|| format!("unknown lease {id}"))?;
             env.extend(l.env.clone());
+            path.extend(l.path.iter().map(|p| p.display().to_string()));
             if let Some(c) = &l.container {
                 if container.replace(c.clone()).is_some() {
                     bail!("a process can only run in one environment");
                 }
             }
+        }
+        if !path.is_empty() {
+            let rest = match &container {
+                Some(c) => c.path.clone(),
+                None => base.get("PATH").cloned().or_else(|| std::env::var("PATH").ok()).unwrap_or_default(),
+            };
+            path.push(rest);
+            env.insert("PATH".into(), path.join(":"));
         }
         Ok((env, container))
     }
@@ -361,7 +382,7 @@ impl Session {
     async fn run_inner(&self, req: u64, spec: SpawnSpec) -> Result<(Exit, Option<u64>)> {
         let tmp = self.run_dir.join("tmp").join(req.to_string());
         fs::create_dir_all(&tmp)?;
-        let (lease_env, container) = self.lease_env(&spec.leases)?;
+        let (lease_env, container) = self.lease_env(&spec.leases, &spec.env)?;
         let mut env = spec.env.clone();
         env.extend(lease_env);
         env.insert("TMPDIR".into(), tmp.display().to_string());

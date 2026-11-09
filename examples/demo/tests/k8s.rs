@@ -2,9 +2,8 @@
 use std::process::Command;
 
 fn kubectl(args: &[&str]) -> String {
-    // The k3s image ships kubectl, so the host doesn't need it.
-    let server = format!("k3d-{}-server-0", std::env::var("K3D_CLUSTER").unwrap());
-    let out = Command::new("docker").args(["exec", &server, "kubectl"]).args(args).output().unwrap();
+    // The fixture puts a kubectl matching the cluster on PATH.
+    let out = Command::new("kubectl").args(args).output().expect("kubectl not on PATH");
     assert!(out.status.success(), "kubectl {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).into_owned()
 }

@@ -16,12 +16,7 @@ use crate::session::{Container, Lease, LeaseKind, Session};
 pub async fn setup(s: &Session, id: u64, name: &str, role: Role, spec: FixtureSpec, exclusive: bool) -> Result<Reply> {
     let (lease, debug_hint) = match spec {
         FixtureSpec::Docker(d) => docker_setup(s, id, name, role, d, exclusive).await?,
-        FixtureSpec::K3d(k) => {
-            if role == Role::Environment {
-                bail!("k3d fixtures can only be services (`uses`), not environments (`run-in`)");
-            }
-            k3d_setup(s, id, name, k).await?
-        }
+        FixtureSpec::K3d(k) => k3d_setup(s, id, name, role, k, exclusive).await?,
         FixtureSpec::Command(c) => {
             if role == Role::Environment {
                 bail!("command fixtures can only be services (`uses`), not environments (`run-in`)");
@@ -39,7 +34,10 @@ pub async fn teardown(s: &Session, lease: Lease) {
         LeaseKind::Container(name) => {
             let _ = docker(["rm", "-f", &name]).await;
         }
-        LeaseKind::K3d(cluster) => {
+        LeaseKind::K3d { cluster, runner } => {
+            if let Some(r) = runner {
+                let _ = docker(["rm", "-f", &r]).await;
+            }
             if let Err(e) = tool("k3d", ["cluster", "delete", &cluster]).await {
                 eprintln!("xtest-agent: deleting k3d cluster {cluster}: {e:#}");
             }
@@ -99,9 +97,19 @@ pub fn k3d_cluster_name(run_id: &str, lease: u64) -> String {
     format!("xt{lease}-{run_id}")
 }
 
-async fn k3d_setup(s: &Session, id: u64, fixture: &str, k: K3dSpec) -> Result<(Lease, Option<String>)> {
+async fn k3d_setup(
+    s: &Session,
+    id: u64,
+    fixture: &str,
+    role: Role,
+    k: K3dSpec,
+    exclusive: bool,
+) -> Result<(Lease, Option<String>)> {
     if !s.docker {
         bail!("fixture `{fixture}` needs docker for k3d, which is not available on this host");
+    }
+    if role == Role::Environment && k.runner.is_none() {
+        bail!("k3d fixture `{fixture}` needs a `runner` image to be used with `run-in`");
     }
     let cluster = k3d_cluster_name(&s.run_id, id);
     let kubeconfig = s.run_dir.join("tmp").join(format!("kubeconfig-{id}.yaml"));
@@ -131,29 +139,75 @@ async fn k3d_setup(s: &Session, id: u64, fixture: &str, k: K3dSpec) -> Result<(L
     args.extend(k.args.iter().cloned());
 
     let created = tool("k3d", &args).await.context("creating k3d cluster");
+    let mut runner: Option<Container> = None;
     let ready = async {
         created?;
         let config = tool("k3d", ["kubeconfig", "get", &cluster]).await?;
         std::fs::write(&kubeconfig, config)?;
-        let mut env = BTreeMap::from([("KUBECONFIG".to_string(), kubeconfig.display().to_string())]);
+        let bin = provide_kubectl(s, &cluster, id).await.context("providing kubectl")?;
+        let env = BTreeMap::from([("KUBECONFIG".to_string(), kubeconfig.display().to_string())]);
+        let lease = Lease { kind: LeaseKind::K3d { cluster: cluster.clone(), runner: None }, env, container: None, path: vec![bin] };
         if let Some(r) = &k.ready {
             let cmd: Vec<String> = r.cmd.iter().flatten().map(|a| fill(a)).collect();
+            let mut env = lease.env.clone();
+            // Same PATH the tests get, so the ready command can use kubectl.
+            let path = std::env::var("PATH").unwrap_or_default();
+            env.insert("PATH".into(), format!("{}:{path}", lease.path[0].display()));
             wait_for_command(s, &cmd, &env, r.timeout).await?;
         }
-        env.extend(k.export.iter().map(|(name, v)| (name.clone(), fill(v))));
-        anyhow::Ok(env)
+        if let (Role::Environment, Some(image)) = (role, &k.runner) {
+            let image = ensure_image(s, image).await.context("runner image")?;
+            runner = Some(start_environment(s, id, fixture, &image, &BTreeMap::new(), exclusive).await?);
+        }
+        anyhow::Ok(lease)
     }
     .await;
     match ready {
-        Ok(env) => {
-            let hint = format!("KUBECONFIG={} kubectl get pods -A", kubeconfig.display());
-            Ok((Lease { kind: LeaseKind::K3d(cluster), env, container: None }, Some(hint)))
+        Ok(mut lease) => {
+            lease.env.extend(k.export.iter().map(|(name, v)| (name.clone(), fill(v))));
+            let hint = match &runner {
+                Some(c) => format!("docker exec -it {} sh", c.name),
+                None => format!("KUBECONFIG={} {}/kubectl get pods -A", kubeconfig.display(), lease.path[0].display()),
+            };
+            lease.kind = LeaseKind::K3d { cluster, runner: runner.as_ref().map(|c| c.name.clone()) };
+            lease.container = runner;
+            Ok((lease, Some(hint)))
         }
         Err(e) => {
+            if let Some(c) = runner {
+                let _ = docker(["rm", "-f", &c.name]).await;
+            }
             let _ = tool("k3d", ["cluster", "delete", &cluster]).await;
             Err(e)
         }
     }
+}
+
+/// Makes `kubectl` available from the cluster itself: the k3s binary in the
+/// node image is static and acts as kubectl when called by that name. It is
+/// copied once per image into `<root>/tools`, then hardlinked into the run's
+/// tmp dir (which environment containers can see too). Returns the bin dir.
+async fn provide_kubectl(s: &Session, cluster: &str, id: u64) -> Result<std::path::PathBuf> {
+    let server = format!("k3d-{cluster}-server-0");
+    let image = docker(["inspect", "-f", "{{.Image}}", &server]).await?;
+    let image = image.trim().trim_start_matches("sha256:");
+    let cached = s.root.join("tools/k3s").join(&image[..image.len().min(16)]).join("k3s");
+    if !cached.exists() {
+        std::fs::create_dir_all(cached.parent().unwrap())?;
+        // Unique per agent and lease: two clusters may be set up at once.
+        let tmp = cached.with_extension(format!("tmp.{}.{id}", std::process::id()));
+        docker(["cp".as_ref(), format!("{server}:/bin/k3s").as_ref(), tmp.as_os_str()]).await?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555))?;
+        std::fs::rename(&tmp, &cached)?;
+    }
+    let bin = s.run_dir.join("tmp").join(format!("k3d-{id}")).join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let kubectl = bin.join("kubectl");
+    if std::fs::hard_link(&cached, &kubectl).is_err() {
+        std::fs::copy(&cached, &kubectl)?;
+    }
+    Ok(bin)
 }
 
 /// Runs `cmd` on the host (with the sandbox's paths) until it exits 0.
@@ -178,18 +232,9 @@ async fn wait_for_command(
     }
 }
 
-async fn docker_setup(
-    s: &Session,
-    id: u64,
-    fixture: &str,
-    role: Role,
-    d: DockerSpec,
-    exclusive: bool,
-) -> Result<(Lease, Option<String>)> {
-    if !s.docker {
-        bail!("fixture `{fixture}` needs docker, which is not available on this host");
-    }
-    let image = match &d.image {
+/// Pulls or builds an image; returns the name to run.
+async fn ensure_image(s: &Session, image: &ImageSource) -> Result<String> {
+    Ok(match image {
         ImageSource::Pull(image) => image.clone(),
         ImageSource::Build { dockerfile, context, tag } => {
             if docker(["image", "inspect", tag]).await.is_err() {
@@ -201,51 +246,114 @@ async fn docker_setup(
             }
             tag.clone()
         }
-    };
+    })
+}
 
-    let name = format!("xtest-{}-{id}", s.run_id);
-    let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--name".into(), name.clone()];
-    for label in [
+fn labels(s: &Session, fixture: &str) -> Vec<String> {
+    [
         format!("xtest.run={}", s.run_id),
         format!("xtest.root={}", s.root.display()),
         format!("xtest.fixture={fixture}"),
-    ] {
-        args.extend(["--label".into(), label]);
+    ]
+    .into_iter()
+    .flat_map(|l| ["--label".to_string(), l])
+    .collect()
+}
+
+/// Starts a container that tests run in: as the agent's uid, on the host
+/// network, with the sandbox mounted at its original paths.
+async fn start_environment(
+    s: &Session,
+    id: u64,
+    fixture: &str,
+    image: &str,
+    env: &BTreeMap<String, String>,
+    exclusive: bool,
+) -> Result<Container> {
+    let name = format!("xtest-{}-{id}", s.run_id);
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--name".into(), name.clone()];
+    args.extend(labels(s, fixture));
+    args.extend(["--user".into(), format!("{uid}:{gid}"), "--network".into(), "host".into()]);
+    for (k, v) in env {
+        args.extend(["-e".into(), format!("{k}={v}")]);
     }
+    // The uid usually has no passwd entry in the image; tools that look up
+    // the user name fall back to these.
+    for var in ["USER", "LOGNAME"] {
+        if let (Ok(v), false) = (std::env::var(var), env.contains_key(var)) {
+            args.extend(["-e".into(), format!("{var}={v}")]);
+        }
+    }
+    // The sandbox appears at the original paths, just like outside docker.
+    for m in s.mirrors() {
+        args.extend(["-v".into(), format!("{}:{}", s.host_path(&m).display(), m.display())]);
+    }
+    let tmp = s.run_dir.join("tmp");
+    args.extend(["-v".into(), format!("{0}:{0}", tmp.display())]);
+    args.extend(["--entrypoint".into(), "sleep".into(), image.into(), "infinity".into()]);
+    docker(&args).await.context("starting container")?;
+
+    let inspected = async {
+        let pid = docker(["inspect", "-f", "{{.State.Pid}}", &name]).await?;
+        let cgroup = pid.trim().parse().ok().and_then(memory::cgroup_of);
+        let envs = docker(["inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", &name]).await?;
+        let path = envs
+            .lines()
+            .find_map(|l| l.strip_prefix("PATH="))
+            .unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            .to_string();
+        anyhow::Ok(Container { name: name.clone(), cgroup, exclusive, path })
+    }
+    .await;
+    if inspected.is_err() {
+        let _ = docker(["rm", "-f", &name]).await;
+    }
+    inspected
+}
+
+async fn docker_setup(
+    s: &Session,
+    id: u64,
+    fixture: &str,
+    role: Role,
+    d: DockerSpec,
+    exclusive: bool,
+) -> Result<(Lease, Option<String>)> {
+    if !s.docker {
+        bail!("fixture `{fixture}` needs docker, which is not available on this host");
+    }
+    let image = ensure_image(s, &d.image).await?;
+
+    if role == Role::Environment {
+        let c = start_environment(s, id, fixture, &image, &d.env, exclusive).await?;
+        if let Some(r) = &d.ready {
+            // Ports aren't published for environments; only `cmd` applies.
+            let r = Ready { tcp: None, ..r.clone() };
+            if let Err(e) = wait_ready(&c.name, &r, &BTreeMap::new()).await {
+                let _ = docker(["rm", "-f", &c.name]).await;
+                return Err(e);
+            }
+        }
+        let hint = format!("docker exec -it {} sh", c.name);
+        let lease = Lease { kind: LeaseKind::Container(c.name.clone()), env: BTreeMap::new(), container: Some(c), path: vec![] };
+        return Ok((lease, Some(hint)));
+    }
+
+    let name = format!("xtest-{}-{id}", s.run_id);
+    let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--name".into(), name.clone()];
+    args.extend(labels(s, fixture));
     for (k, v) in &d.env {
         args.extend(["-e".into(), format!("{k}={v}")]);
     }
     let mut ports = d.ports.clone();
-    match role {
-        Role::Environment => {
-            let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-            args.extend(["--user".into(), format!("{uid}:{gid}"), "--network".into(), "host".into()]);
-            // The uid usually has no passwd entry in the image; tools that
-            // look up the user name fall back to these.
-            for var in ["USER", "LOGNAME"] {
-                if let (Ok(v), false) = (std::env::var(var), d.env.contains_key(var)) {
-                    args.extend(["-e".into(), format!("{var}={v}")]);
-                }
-            }
-            // The sandbox appears at the original paths, just like outside docker.
-            for m in s.mirrors() {
-                args.extend(["-v".into(), format!("{}:{}", s.host_path(&m).display(), m.display())]);
-            }
-            let tmp = s.run_dir.join("tmp");
-            args.extend(["-v".into(), format!("{0}:{0}", tmp.display())]);
-            args.extend(["--entrypoint".into(), "sleep".into(), image, "infinity".into()]);
-            ports.clear();
-        }
-        Role::Service => {
-            ports.extend(d.ready.as_ref().and_then(|r| r.tcp));
-            ports.sort();
-            ports.dedup();
-            for p in &ports {
-                args.extend(["-p".into(), format!("127.0.0.1::{p}")]);
-            }
-            args.push(image);
-        }
+    ports.extend(d.ready.as_ref().and_then(|r| r.tcp));
+    ports.sort();
+    ports.dedup();
+    for p in &ports {
+        args.extend(["-p".into(), format!("127.0.0.1::{p}")]);
     }
+    args.push(image);
     docker(&args).await.context("starting container")?;
 
     let started = async {
@@ -265,24 +373,16 @@ async fn docker_setup(
         anyhow::Ok(env)
     }
     .await;
-
-    let env = match started {
-        Ok(env) => env,
+    match started {
+        Ok(env) => {
+            let hint = format!("docker logs {name}");
+            Ok((Lease { kind: LeaseKind::Container(name), env, container: None, path: vec![] }, Some(hint)))
+        }
         Err(e) => {
             let _ = docker(["rm", "-f", &name]).await;
-            return Err(e);
+            Err(e)
         }
-    };
-    let (container, hint) = match role {
-        Role::Environment => {
-            let pid = docker(["inspect", "-f", "{{.State.Pid}}", &name]).await?;
-            let cgroup = pid.trim().parse().ok().and_then(memory::cgroup_of);
-            let c = Container { name: name.clone(), cgroup, exclusive };
-            (Some(c), format!("docker exec -it {name} sh"))
-        }
-        Role::Service => (None, format!("docker logs {name}")),
-    };
-    Ok((Lease { kind: LeaseKind::Container(name), env, container }, Some(hint)))
+    }
 }
 
 async fn wait_ready(name: &str, r: &Ready, mapped: &BTreeMap<u16, u16>) -> Result<()> {
@@ -348,7 +448,7 @@ async fn command_setup(s: &Session, c: CommandSpec) -> Result<Lease> {
     };
     let handle = parsed.handle.unwrap_or_default();
     let teardown = c.teardown.map(|t| t.replace("{handle}", &shell_quote(&handle)));
-    Ok(Lease { kind: LeaseKind::Command { teardown, cwd: c.cwd }, env: parsed.env, container: None })
+    Ok(Lease { kind: LeaseKind::Command { teardown, cwd: c.cwd }, env: parsed.env, container: None, path: vec![] })
 }
 
 fn shell_quote(s: &str) -> String {

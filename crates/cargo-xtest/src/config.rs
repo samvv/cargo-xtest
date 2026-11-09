@@ -90,6 +90,15 @@ pub struct Fixture {
     pub args: Vec<String>,
     /// How long cluster creation may take.
     pub timeout: Option<String>,
+    /// Container tests run in when a k3d cluster is their environment.
+    pub runner: Option<RunnerCfg>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerCfg {
+    pub image: Option<String>,
+    pub build: Option<BuildCfg>,
 }
 
 impl Fixture {
@@ -109,6 +118,7 @@ impl Fixture {
         add(self.agents.is_some(), "agents");
         add(!self.args.is_empty(), "args");
         add(self.timeout.is_some(), "timeout");
+        add(self.runner.is_some(), "runner");
         f
     }
 }
@@ -191,7 +201,7 @@ impl Config {
             let allowed: &[&str] = match f.kind {
                 FixtureKind::Docker => &["image", "build", "env", "ports", "ready", "export"],
                 FixtureKind::Command => &["setup", "teardown"],
-                FixtureKind::K3d => &["image", "servers", "agents", "args", "timeout", "ready", "export"],
+                FixtureKind::K3d => &["image", "servers", "agents", "args", "timeout", "ready", "export", "runner"],
             };
             if let Some(bad) = f.set_fields().into_iter().find(|x| !allowed.contains(x)) {
                 bail!("fixture `{name}`: `{bad}` is not supported by {:?} fixtures", f.kind);
@@ -212,7 +222,13 @@ impl Config {
                         bail!("fixture `{name}`: command fixtures need `setup`");
                     }
                 }
-                FixtureKind::K3d => {}
+                FixtureKind::K3d => {
+                    if let Some(r) = &f.runner {
+                        if r.image.is_some() == r.build.is_some() {
+                            bail!("fixture `{name}`: set exactly one of `runner.image` or `runner.build`");
+                        }
+                    }
+                }
             }
         }
         for (pname, p) in &self.profile {
@@ -220,6 +236,16 @@ impl Config {
                 for f in o.run_in.iter().chain(&o.uses) {
                     if !self.fixture.contains_key(f) {
                         bail!("profile `{pname}`: unknown fixture `{f}`");
+                    }
+                }
+                if let Some(f) = o.run_in.as_ref().and_then(|n| self.fixture.get(n).map(|f| (n, f))) {
+                    match f.1.kind {
+                        FixtureKind::Command => bail!("profile `{pname}`: command fixture `{}` cannot be used with `run-in`", f.0),
+                        FixtureKind::K3d if f.1.runner.is_none() => bail!(
+                            "profile `{pname}`: k3d fixture `{}` needs `runner = {{ image = \"...\" }}` to be used with `run-in`",
+                            f.0
+                        ),
+                        _ => {}
                     }
                 }
             }
@@ -327,6 +353,15 @@ mod tests {
         assert!(err.contains("`setup` is not supported"), "{err}");
         let cfg: Config = toml::from_str("[fixture.x]\nkind = \"docker\"\nimage = \"a\"\nagents = 2\n").unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn k3d_run_in_needs_a_runner() {
+        let base = "[fixture.k8s]\nkind = \"k3d\"\n[[profile.default.overrides]]\nfilter = \"all()\"\nrun-in = \"k8s\"\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert!(cfg.validate().unwrap_err().to_string().contains("needs `runner"));
+        let cfg: Config = toml::from_str(&base.replace("kind = \"k3d\"\n", "kind = \"k3d\"\nrunner = { image = \"archlinux\" }\n")).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

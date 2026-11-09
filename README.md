@@ -64,8 +64,9 @@ agents = 1                           # default 0
 # image = "rancher/k3s:v1.31.4-k3s1"
 args = ["--no-lb"]                   # extra `k3d cluster create` arguments
 timeout = "5m"                       # for cluster creation (default 300s)
-ready = { cmd = "docker exec k3d-{cluster}-server-0 kubectl wait --for=condition=Ready nodes --all", timeout = "3m" }
+ready = { cmd = "kubectl wait --for=condition=Ready nodes --all", timeout = "3m" }
 export = { K3D_CLUSTER = "{cluster}" }
+runner = { image = "archlinux:latest" }  # needed for `run-in`; or `build = {...}`
 
 [fixture.tmpstate]
 kind = "command"
@@ -86,10 +87,13 @@ Without any `[[host]]`, tests run on this machine.
 Matchers: `=exact`, `~substring`, `/regex/`. Plain `test(x)` matches a
 substring; plain values for the other predicates match exactly.
 
-**k3d fixtures** are services only (`uses`). Tests get `KUBECONFIG` pointing
-to the cluster's kubeconfig; `{cluster}` and `{kubeconfig}` can be used in
-`export` and `ready.cmd`, which runs on the host until it succeeds. The host
-needs `k3d` and docker. Clusters are named `xt<lease>-<run id>` and labeled,
+**k3d fixtures** give tests `KUBECONFIG` and a `kubectl` on `PATH` that
+matches the cluster: the static k3s binary from the node image, cached once
+per image on the host. With `uses`, tests run on the host; with `run-in`, they
+run in a `runner` container (host network, sandbox at its original paths).
+`{cluster}` and `{kubeconfig}` can be used in `export` and `ready.cmd`, which
+runs on the host (with that `kubectl`) until it succeeds. The host needs
+`k3d` and docker. Clusters are named `xt<lease>-<run id>` and labeled,
 so the agent deletes leftover clusters properly on its next start.
 
 **Environment containers** run as your uid, with `--network host`, the

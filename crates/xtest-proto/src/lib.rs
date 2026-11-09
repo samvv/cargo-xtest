@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped whenever the messages below change incompatibly.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Largest frame we accept. Blob uploads are chunked well below this.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -133,7 +133,7 @@ pub enum FixtureSpec {
 }
 
 /// A Kubernetes cluster made with `k3d cluster create`. Tests get its
-/// kubeconfig in `KUBECONFIG`.
+/// kubeconfig in `KUBECONFIG` and a matching `kubectl` on `PATH`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct K3dSpec {
     pub servers: u32,
@@ -148,6 +148,9 @@ pub struct K3dSpec {
     pub ready: Option<Ready>,
     /// Env vars exported to tests; may use `{cluster}` and `{kubeconfig}`.
     pub export: BTreeMap<String, String>,
+    /// Image of the container tests run in when the cluster is their
+    /// environment (`run-in`).
+    pub runner: Option<ImageSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
