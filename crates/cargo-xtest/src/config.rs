@@ -169,6 +169,16 @@ pub struct Host {
     pub ssh_program: Option<Vec<String>>,
     /// Local path of the agent binary to install on the host.
     pub agent: Option<PathBuf>,
+    /// Cap on the host's blob store, e.g. "10G". Least recently used blobs
+    /// are evicted when an agent starts.
+    pub store_size: Option<String>,
+}
+
+impl Host {
+    /// This machine, when the config names no hosts.
+    pub fn local() -> Host {
+        Host { name: "local".into(), ssh: None, slots: None, root: None, ssh_program: None, agent: None, store_size: None }
+    }
 }
 
 /// A profile with the default profile's values filled in and filters parsed.
@@ -238,6 +248,11 @@ impl Config {
                         }
                     }
                 }
+            }
+        }
+        for h in &self.host {
+            if let Some(size) = &h.store_size {
+                parse_size(size).with_context(|| format!("host `{}`: store-size", h.name))?;
             }
         }
         for (pname, p) in &self.profile {

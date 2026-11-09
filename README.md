@@ -79,6 +79,7 @@ name = "pi4"
 ssh = "ci@pi4.lan"
 slots = 4
 # root = "/data/xtest"               # agent data directory on the host
+# store-size = "10G"                 # cap on the blob store (default 10G)
 ```
 
 Without any `[[host]]`, tests run on this machine.
@@ -137,20 +138,41 @@ measured in the last run (`<target>/xtest/memory.json`), or the profile's
 The report shows each test's measured peak; `--list` shows the estimate and
 where it came from.
 
+## Disk use and cleanup
+
+Each agent cleans up when it starts:
+
+- runs that are no longer running, with their containers, clusters and
+  networks (runs kept with `--keep-fixtures` stay);
+- least recently used blobs, while the store is bigger than `store-size`.
+  Blobs used in the last 24 hours, or still linked into a running test run,
+  are never evicted;
+- agent builds, cached `kubectl` binaries and images built for fixtures that
+  have not been used for 7 days.
+
+`cargo xtest clean [--host NAME]...` removes everything that no running test run
+uses, right away: kept runs and their fixtures, all store blobs, old agent
+builds, cached tools and built images. Images pulled from a registry are left
+alone.
+
 ## CLI
 
 ```
 cargo xtest [FILTERS]... [-E EXPR]... [-p PKG] [--release] [--target T]
             [--profile P] [--host NAME]... [--ignored | --include-ignored]
             [--keep-fixtures] [--list] [--config FILE]
+cargo xtest clean [--host NAME]... [--config FILE]
 ```
+
+A filter that is literally `clean` must be written as `-E 'test(clean)'`.
 
 Exit codes: 0 when all tests pass, 100 when any test fails, 1 on errors,
 130 when interrupted.
 
 `--keep-fixtures` keeps the test-scoped fixtures of failed tests and prints
-how to inspect them (`docker exec -it ... sh`). Delete the run's `keep` file
-under `<root>/runs/` and the next run cleans it up.
+how to inspect them (`docker exec -it ... sh`). `cargo xtest clean` removes
+them; so does deleting the run's `keep` file under `<root>/runs/` (the next
+run cleans it up).
 
 ## Layout
 

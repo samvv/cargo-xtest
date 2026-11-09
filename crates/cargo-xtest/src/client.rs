@@ -60,23 +60,52 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Command that runs the agent's `sub`command on `host` (installing the
+/// agent there first if needed), with the host's root and store size.
+async fn agent_command(host: &Host, sub: &[&str]) -> Result<Command> {
+    let agent_bin = local_agent_binary(host)?;
+    let mut extra: Vec<String> = sub.iter().map(|s| s.to_string()).collect();
+    if let Some(size) = &host.store_size {
+        extra.extend(["--store-size".into(), crate::config::parse_size(size)?.to_string()]);
+    }
+    Ok(match &host.ssh {
+        None => {
+            let mut c = Command::new(&agent_bin);
+            c.args(&extra);
+            if let Some(root) = &host.root {
+                c.args(["--root", root]);
+            }
+            c
+        }
+        Some(dest) => {
+            let dir = install_remote_agent(host, dest, &agent_bin).await?;
+            // Plain flags and numbers: no quoting needed (or wanted, see `ssh`).
+            debug_assert!(extra.iter().all(|a| a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')));
+            ssh(host, dest, &format!("{dir}; exec \"$D/xtest-agent\" {} --root \"$R\"", extra.join(" ")))
+        }
+    })
+}
+
+/// Runs the agent's garbage collector on `host` now and returns its report.
+/// With `all`, everything no live run uses is removed, kept runs included.
+pub async fn collect_garbage(host: &Host, all: bool) -> Result<String> {
+    let sub: &[&str] = if all { &["gc", "--all"] } else { &["gc"] };
+    let out = agent_command(host, sub)
+        .await?
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .await
+        .with_context(|| format!("running the agent on `{}`", host.name))?;
+    if !out.status.success() {
+        bail!("cleaning `{}` failed", host.name);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 impl Agent {
     pub async fn connect(host: &Host) -> Result<Agent> {
-        let agent_bin = local_agent_binary(host)?;
-        let mut cmd = match &host.ssh {
-            None => {
-                let mut c = Command::new(&agent_bin);
-                c.args(["serve", "--stdio"]);
-                if let Some(root) = &host.root {
-                    c.args(["--root", root]);
-                }
-                c
-            }
-            Some(dest) => {
-                let remote = install_remote_agent(host, dest, &agent_bin).await?;
-                ssh(host, dest, &remote)
-            }
-        };
+        let mut cmd = agent_command(host, &["serve", "--stdio"]).await?;
         // Own process group: a Ctrl-C in the terminal must reach only us, so
         // we can shut the agent down properly.
         cmd.process_group(0)
@@ -245,7 +274,7 @@ fn ssh(host: &Host, dest: &str, script: &str) -> Command {
 }
 
 /// Copies the agent to the host unless that exact build is already there.
-/// Returns the remote command that starts it.
+/// Returns a shell prefix that sets `$R` (the root) and `$D` (the agent's directory).
 async fn install_remote_agent(host: &Host, dest: &str, agent_bin: &Path) -> Result<String> {
     let hash = xtest_agent::store::hash_file(agent_bin)?.to_hex();
     let root = match &host.root {
@@ -272,5 +301,5 @@ async fn install_remote_agent(host: &Host, dest: &str, agent_bin: &Path) -> Resu
             bail!("could not install the agent on `{}`", host.name);
         }
     }
-    Ok(format!("{dir}; exec \"$D/xtest-agent\" serve --stdio --root \"$R\""))
+    Ok(dir)
 }

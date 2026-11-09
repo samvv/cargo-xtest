@@ -26,8 +26,15 @@ use crate::config::format_size;
 use crate::runner::{Case, Ctx, FixtureDef, HostState, MemorySource, Reporter};
 
 #[derive(Parser, Debug)]
-#[command(name = "cargo xtest", version, about = "Run cargo tests on other hosts and inside fixtures")]
+#[command(
+    name = "cargo xtest",
+    version,
+    about = "Run cargo tests on other hosts and inside fixtures",
+    args_conflicts_with_subcommands = true
+)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Cmd>,
     /// Run only tests whose name contains one of these strings.
     filters: Vec<String>,
     /// Filter expression, e.g. `package(db) & test(/integration/)`. Repeatable (any may match).
@@ -72,19 +79,69 @@ struct Args {
     list: bool,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum Cmd {
+    /// Remove everything on the hosts that no running test run uses: kept
+    /// runs and their fixtures, store blobs, old agent builds, cached tools
+    /// and built images.
+    Clean {
+        /// Clean only these hosts.
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+        /// Config file to use instead of `.config/xtest.toml` in the workspace root.
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+    },
+}
+
 fn main() -> ExitCode {
     let mut argv: Vec<OsString> = std::env::args_os().collect();
     if argv.get(1).is_some_and(|a| a == "xtest") {
         argv.remove(1);
     }
     let args = Args::parse_from(argv);
-    match run(args) {
+    let result = match &args.command {
+        Some(Cmd::Clean { hosts, config }) => clean(hosts, config.as_deref()),
+        None => run(args),
+    };
+    match result {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::from(1)
         }
     }
+}
+
+fn clean(wanted: &[String], config: Option<&std::path::Path>) -> Result<ExitCode> {
+    let root = match config {
+        // An explicit config works outside a workspace too.
+        Some(_) => std::env::current_dir()?,
+        None => cargo::workspace()?.root,
+    };
+    let cfg = Config::load(&root, config)?;
+    let hosts = select_hosts(&cfg, wanted)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let results = rt.block_on(async {
+        let mut set = tokio::task::JoinSet::new();
+        for (i, h) in hosts.iter().cloned().enumerate() {
+            set.spawn(async move { (i, client::collect_garbage(&h, true).await) });
+        }
+        let mut results: Vec<_> = set.join_all().await;
+        results.sort_by_key(|(i, _)| *i);
+        results
+    });
+    let mut failed = false;
+    for (h, (_, r)) in hosts.iter().zip(results) {
+        match r {
+            Ok(report) => eprintln!("{:>12} `{}`: {report}", "Cleaned", h.name),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                failed = true;
+            }
+        }
+    }
+    Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
 fn run(args: Args) -> Result<ExitCode> {
@@ -277,7 +334,7 @@ fn run(args: Args) -> Result<ExitCode> {
 
 fn select_hosts(cfg: &Config, wanted: &[String]) -> Result<Vec<Host>> {
     let all = if cfg.host.is_empty() {
-        vec![Host { name: "local".into(), ssh: None, slots: None, root: None, ssh_program: None, agent: None }]
+        vec![Host::local()]
     } else {
         cfg.host.clone()
     };

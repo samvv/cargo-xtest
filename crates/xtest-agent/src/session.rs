@@ -31,6 +31,9 @@ pub struct Session {
     store: Store,
     out: mpsc::UnboundedSender<Option<AgentMsg>>,
     state: Mutex<State>,
+    /// Shared store lock, held from `HaveBlobs` until `Materialize` is done,
+    /// so garbage collection can't evict blobs this run is about to link.
+    store_lock: Mutex<Option<fs::File>>,
 }
 
 #[derive(Default)]
@@ -76,7 +79,7 @@ pub enum LeaseKind {
     Command { teardown: Option<String>, cwd: PathBuf },
 }
 
-pub async fn serve(root: PathBuf) -> Result<()> {
+pub async fn serve(root: PathBuf, store_size: u64) -> Result<()> {
     // The controller decides when we stop; a terminal Ctrl-C or a dropped
     // SSH session must not skip cleanup.
     unsafe {
@@ -92,7 +95,11 @@ pub async fn serve(root: PathBuf) -> Result<()> {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    gc::collect(&root, docker);
+    // Mark this agent build as used, so other agents' GC keeps it.
+    if let Ok(exe) = std::env::current_exe() {
+        gc::touch(&exe);
+    }
+    gc::collect(&root, docker, &gc::Policy::startup(store_size));
 
     let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
     let run_id = format!("{secs}-{}", std::process::id());
@@ -125,6 +132,7 @@ pub async fn serve(root: PathBuf) -> Result<()> {
         agent_exe,
         out: tx,
         state: Mutex::default(),
+        store_lock: Mutex::default(),
     });
 
     let mut stdin = tokio::io::stdin();
@@ -182,7 +190,14 @@ impl Session {
                 self.reply(req, res);
             }
             Request::HaveBlobs { hashes } => {
-                let hashes = hashes.into_iter().filter(|h| !self.store.has(h)).collect();
+                {
+                    let mut held = self.store_lock.lock().unwrap();
+                    if held.is_none() {
+                        // Blocks only while another agent's GC is evicting blobs.
+                        *held = gc::lock(&gc::store_lock_path(&self.root), libc::LOCK_SH);
+                    }
+                }
+                let hashes = hashes.into_iter().filter(|h| !self.store.use_blob(h)).collect();
                 self.reply(req, Ok(Reply::Missing { hashes }));
             }
             Request::PutBlob { hash, offset, data, last } => {
@@ -191,6 +206,8 @@ impl Session {
             }
             Request::Materialize { mirrors, files } => {
                 let res = self.materialize(mirrors, &files);
+                // Every blob is linked or copied now (or never will be).
+                self.store_lock.lock().unwrap().take();
                 self.reply(req, res.map(|_| Reply::Ok).map_err(err));
             }
             Request::Spawn(spec) => {

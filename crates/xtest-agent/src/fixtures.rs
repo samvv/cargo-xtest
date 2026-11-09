@@ -326,20 +326,28 @@ async fn provide_kubectl(s: &Session, cluster: &str, id: u64) -> Result<std::pat
     let image = docker(["inspect", "-f", "{{.Image}}", &server]).await?;
     let image = image.trim().trim_start_matches("sha256:");
     let cached = s.root.join("tools/k3s").join(&image[..image.len().min(16)]).join("k3s");
-    if !cached.exists() {
-        std::fs::create_dir_all(cached.parent().unwrap())?;
-        // Unique per agent and lease: two clusters may be set up at once.
-        let tmp = cached.with_extension(format!("tmp.{}.{id}", std::process::id()));
-        docker(["cp".as_ref(), format!("{server}:/bin/k3s").as_ref(), tmp.as_os_str()]).await?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555))?;
-        std::fs::rename(&tmp, &cached)?;
-    }
     let bin = s.run_dir.join("tmp").join(format!("k3d-{id}")).join("bin");
     std::fs::create_dir_all(&bin)?;
     let kubectl = bin.join("kubectl");
-    if std::fs::hard_link(&cached, &kubectl).is_err() {
-        std::fs::copy(&cached, &kubectl)?;
+    // Twice: another agent's GC may remove an unused cache entry between
+    // our check and the link.
+    for attempt in 0.. {
+        if !cached.exists() {
+            std::fs::create_dir_all(cached.parent().unwrap())?;
+            // Unique per agent and lease: two clusters may be set up at once.
+            let tmp = cached.with_extension(format!("tmp.{}.{id}", std::process::id()));
+            docker(["cp".as_ref(), format!("{server}:/bin/k3s").as_ref(), tmp.as_os_str()]).await?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555))?;
+            std::fs::rename(&tmp, &cached)?;
+        }
+        crate::gc::touch(&cached);
+        let res = std::fs::hard_link(&cached, &kubectl).or_else(|_| std::fs::copy(&cached, &kubectl).map(drop));
+        match res {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt == 0 => continue,
+            r => r?,
+        }
+        break;
     }
     Ok(bin)
 }
@@ -371,12 +379,26 @@ async fn ensure_image(s: &Session, image: &ImageSource) -> Result<String> {
     Ok(match image {
         ImageSource::Pull(image) => image.clone(),
         ImageSource::Build { dockerfile, context, tag } => {
+            // Marks the image as used, so GC keeps it (see `gc::collect_images`).
+            let marker = crate::gc::image_marker(&s.root, tag);
+            std::fs::create_dir_all(marker.parent().unwrap())?;
+            std::fs::File::create(&marker)?.set_modified(std::time::SystemTime::now())?;
             if docker(["image", "inspect", tag]).await.is_err() {
                 let df = s.host_path(dockerfile);
                 let ctx = s.host_path(context);
-                docker(["build".as_ref(), "-t".as_ref(), tag.as_ref(), "-f".as_ref(), df.as_os_str(), ctx.as_os_str()])
-                    .await
-                    .context("building image")?;
+                let label = format!("xtest.root={}", s.root.display());
+                docker([
+                    "build".as_ref(),
+                    "--label".as_ref(),
+                    label.as_ref(),
+                    "-t".as_ref(),
+                    tag.as_ref(),
+                    "-f".as_ref(),
+                    df.as_os_str(),
+                    ctx.as_os_str(),
+                ])
+                .await
+                .context("building image")?;
             }
             tag.clone()
         }

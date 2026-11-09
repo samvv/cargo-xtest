@@ -30,6 +30,19 @@ impl Store {
         self.blob_path(hash).is_file()
     }
 
+    /// Like [`has`](Self::has), and marks the blob as used now so garbage
+    /// collection keeps it.
+    pub fn use_blob(&self, hash: &Hash) -> bool {
+        let path = self.blob_path(hash);
+        match File::open(&path) {
+            Ok(f) => {
+                let _ = f.set_modified(std::time::SystemTime::now());
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     fn incoming_path(&self, hash: &Hash) -> PathBuf {
         // The pid keeps two agents uploading the same blob from colliding.
         self.dir
