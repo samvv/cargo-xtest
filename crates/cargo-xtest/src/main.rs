@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use xtest_proto::{CommandSpec, DockerSpec, FixtureSpec, ImageSource, K3dSpec, Ready};
 
 use crate::config::{Config, FixtureKind, Host};
+use xtest_agent::compat::Glibc;
 use crate::filter::{Filter, Subject};
 use crate::config::format_size;
 use crate::runner::{Case, Ctx, FixtureDef, HostState, MemorySource, Reporter};
@@ -243,8 +244,10 @@ fn run(args: Args) -> Result<ExitCode> {
             if let Some(e) = first_err {
                 return Err(e);
             }
+            let needs = std::sync::OnceLock::new();
             for h in &hosts {
                 check_host(&h.agent, target.as_deref(), &reporter)?;
+                check_glibc(&h.agent, &built.executables, &needs)?;
             }
             let bins: Vec<_> = built.tests.into_iter().map(Arc::new).collect();
             let found = runner::discover(&hosts[0].agent, &bins).await?;
@@ -450,6 +453,38 @@ fn check_host(agent: &client::Agent, target: Option<&str>, reporter: &Reporter) 
         ));
     }
     Ok(())
+}
+
+/// Checks that the test binaries (built here) can run on the host. They are
+/// only scanned when the host's glibc is older than ours, or missing.
+fn check_glibc(
+    agent: &client::Agent,
+    executables: &[std::path::PathBuf],
+    needs: &std::sync::OnceLock<Vec<(std::path::PathBuf, Glibc)>>,
+) -> Result<()> {
+    let have = agent.info.glibc.map(|(a, b)| Glibc(a, b));
+    let Some(ours) = xtest_agent::compat::running_glibc() else { return Ok(()) };
+    if have.is_some_and(|h| h >= ours) {
+        return Ok(());
+    }
+    let needs = needs.get_or_init(|| {
+        executables
+            .iter()
+            .filter_map(|e| Some((e.clone(), xtest_agent::compat::required_glibc(e).ok()??)))
+            .collect()
+    });
+    let Some((exe, needed)) = needs.iter().max_by_key(|(_, g)| *g) else { return Ok(()) };
+    if have.is_some_and(|h| h >= *needed) {
+        return Ok(());
+    }
+    bail!(
+        "host `{}` has {}, but {} (built here, with glibc {ours}) needs glibc {needed} or newer. \
+         Build for a musl target instead: set `target = \"{}-unknown-linux-musl\"` in the profile, or pass --target",
+        agent.name,
+        have.map_or("no glibc (musl?)".to_string(), |g| format!("glibc {g}")),
+        exe.file_name().unwrap_or_default().to_string_lossy(),
+        agent.info.arch
+    )
 }
 
 /// Memory assumed for a fixture that hasn't been measured yet.

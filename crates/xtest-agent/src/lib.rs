@@ -1,6 +1,7 @@
 //! The agent that runs on each test host. It is started by the controller
 //! (over SSH, or locally) and speaks the `xtest-proto` protocol on stdio.
 
+pub mod compat;
 mod fixtures;
 pub mod gc;
 pub mod memory;

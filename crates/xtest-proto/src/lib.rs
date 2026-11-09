@@ -14,7 +14,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped whenever the messages below change incompatibly.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// Largest frame we accept. Blob uploads are chunked well below this.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -245,6 +245,10 @@ pub struct HostInfo {
     /// Whether processes can see the sandbox at the original paths.
     pub mirroring: bool,
     pub docker: bool,
+    /// The host's glibc version (major, minor), or `None` without glibc.
+    pub glibc: Option<(u32, u32)>,
+    /// Free space under the agent's root directory, in bytes.
+    pub disk_free: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

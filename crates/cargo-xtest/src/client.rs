@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use xtest_proto::*;
 
 use crate::config::Host;
+use xtest_agent::compat::Glibc;
 
 pub enum ProcEvent {
     Output(Stream, Vec<u8>),
@@ -201,6 +202,8 @@ impl Agent {
                 run_dir: PathBuf::new(),
                 mirroring: false,
                 docker: false,
+                glibc: None,
+                disk_free: u64::MAX,
             },
             tx,
             routes,
@@ -308,8 +311,9 @@ fn ssh(host: &Host, dest: &str, script: &str) -> Command {
     c
 }
 
-/// Copies the agent to the host unless that exact build is already there.
-/// Returns a shell prefix that sets `$R` (the root) and `$D` (the agent's directory).
+/// Copies the agent to the host unless that exact build is already there,
+/// and checks that it can run there. Returns a shell prefix that sets `$R`
+/// (the root) and `$D` (the agent's directory).
 async fn install_remote_agent(host: &Host, dest: &str, agent_bin: &Path) -> Result<String> {
     let hash = xtest_agent::store::hash_file(agent_bin)?.to_hex();
     let root = match &host.root {
@@ -318,23 +322,81 @@ async fn install_remote_agent(host: &Host, dest: &str, agent_bin: &Path) -> Resu
     };
     let dir = format!("R={root}; D=\"$R/agent/{}\"", &hash[..16]);
 
-    let present = ssh(host, dest, &format!("{dir}; test -x \"$D/xtest-agent\""))
-        .stdin(Stdio::null())
-        .status()
-        .await
-        .with_context(|| format!("running ssh for `{}`", host.name))?;
-    if !present.success() {
-        let script = format!(
-            "{dir}; set -e; mkdir -p \"$D\"; cat > \"$D/.upload.$$\"; \
-             chmod 755 \"$D/.upload.$$\"; mv \"$D/.upload.$$\" \"$D/xtest-agent\""
-        );
-        let mut child = ssh(host, dest, &script).stdin(Stdio::piped()).spawn()?;
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(&tokio::fs::read(agent_bin).await?).await?;
-        drop(stdin);
-        if !child.wait().await?.success() {
-            bail!("could not install the agent on `{}`", host.name);
+    // One round trip: the host's glibc, and whether this agent build is
+    // there and runs.
+    let check = format!(
+        "{dir}; getconf GNU_LIBC_VERSION 2>/dev/null || echo none; \
+         if test -x \"$D/xtest-agent\"; then \
+         if out=$(\"$D/xtest-agent\" --version 2>&1); then echo ok; else echo broken; echo \"$out\"; fi; \
+         else echo missing; fi"
+    );
+    let out = remote_output(host, dest, &check).await?;
+    let mut lines = out.lines();
+    let host_glibc = lines.next().and_then(Glibc::parse);
+    let state = lines.next().unwrap_or("missing").to_string();
+    let details: String = lines.collect::<Vec<_>>().join("\n");
+
+    if let Some(needed) = xtest_agent::compat::required_glibc(agent_bin)? {
+        match host_glibc {
+            Some(have) if have >= needed => {}
+            have => bail!(
+                "it has {}, but the agent built here needs glibc {needed} or newer. \
+                 Build cargo-xtest for a musl target and point `agent` in [[host]] at that xtest-agent \
+                 (e.g. `cargo build --release --target x86_64-unknown-linux-musl -p cargo-xtest`)",
+                have.map_or("no glibc (musl?)".to_string(), |g| format!("glibc {g}"))
+            ),
         }
     }
-    Ok(dir)
+
+    let state_and_details = match state.as_str() {
+        "ok" => return Ok(dir),
+        "broken" => ("broken".to_string(), details),
+        _ => {
+            let script = format!(
+                "{dir}; set -e; mkdir -p \"$D\"; cat > \"$D/.upload.$$\"; \
+                 chmod 755 \"$D/.upload.$$\"; mv \"$D/.upload.$$\" \"$D/xtest-agent\""
+            );
+            let mut child = ssh(host, dest, &script).stdin(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(&tokio::fs::read(agent_bin).await?).await?;
+            drop(stdin);
+            let done = child.wait_with_output().await?;
+            if !done.status.success() {
+                let err = String::from_utf8_lossy(&done.stderr);
+                bail!("could not install the agent: {}{}", err.trim(), disk_hint(&err));
+            }
+            let out = remote_output(host, dest, &format!("{dir}; \"$D/xtest-agent\" --version 2>&1 && echo ok")).await?;
+            if out.lines().last() == Some("ok") {
+                return Ok(dir);
+            }
+            ("broken".to_string(), out)
+        }
+    };
+    let (_, details) = state_and_details;
+    let root_shown = host.root.as_deref().unwrap_or("~/.cache/cargo-xtest");
+    if details.contains("Permission denied") {
+        bail!(
+            "can't run programs from {root_shown}: is it on a filesystem mounted noexec? \
+             (check with `findmnt -T {root_shown}`). Set `root` in [[host]] to a directory where programs may run.\n{}",
+            details.trim()
+        );
+    }
+    bail!("the agent doesn't run there:\n{}", details.trim())
+}
+
+/// Runs a script on the host and returns its stdout.
+async fn remote_output(host: &Host, dest: &str, script: &str) -> Result<String> {
+    let out = ssh(host, dest, script)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| format!("running ssh for `{}`", host.name))?;
+    if out.status.code() == Some(255) {
+        bail!("could not connect to `{}` with ssh: {}", host.name, String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn disk_hint(err: &str) -> &'static str {
+    if err.contains("No space left") { " (the host's disk is full)" } else { "" }
 }

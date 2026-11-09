@@ -235,6 +235,20 @@ pub async fn sync(agent: &Agent, files: &FileSet) -> Result<(usize, u64)> {
     let Reply::Missing { hashes: missing } = agent.request(Request::HaveBlobs { hashes: hashes.into_iter().collect() }).await? else {
         bail!("unexpected reply to HaveBlobs");
     };
+    // Uploads land in the store, and every file that isn't hardlinked is
+    // copied into the run's sandbox as well.
+    let upload: u64 = missing.iter().map(|h| files.sizes.get(h).copied().unwrap_or(0)).sum();
+    let copies: u64 = files.files.values().filter(|f| !f.link).map(|f| files.sizes.get(&f.hash).copied().unwrap_or(0)).sum();
+    let needed = upload + copies + (64 << 20);
+    if needed > agent.info.disk_free {
+        bail!(
+            "only {} is free under the agent's root directory, but this run needs about {} \
+             ({} to upload). Free some space, e.g. with `cargo xtest clean`, or lower `store-size` in [[host]]",
+            format_size(agent.info.disk_free),
+            format_size(needed),
+            format_size(upload)
+        );
+    }
     let by_hash: HashMap<Hash, &PathBuf> = files.files.values().map(|f| (f.hash, &f.path)).collect();
     let mut bytes = 0;
     for hash in &missing {

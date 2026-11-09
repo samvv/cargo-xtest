@@ -31,6 +31,8 @@ pub struct Session {
     store: Store,
     out: mpsc::UnboundedSender<Option<AgentMsg>>,
     state: Mutex<State>,
+    /// The glibc each test binary needs, by host path (scanned once).
+    glibc_needs: Mutex<HashMap<PathBuf, Option<crate::compat::Glibc>>>,
     /// Shared store lock, held from `HaveBlobs` until `Materialize` is done,
     /// so garbage collection can't evict blobs this run is about to link.
     store_lock: Mutex<Option<fs::File>>,
@@ -67,6 +69,9 @@ pub struct Lease {
 #[derive(Clone)]
 pub struct Container {
     pub name: String,
+    pub image: String,
+    /// The image's C library, to check test binaries against.
+    pub libc: crate::compat::Libc,
     pub cgroup: Option<PathBuf>,
     /// Only one test uses it, so the container's peak is that test's peak.
     pub exclusive: bool,
@@ -135,6 +140,7 @@ pub async fn serve(root: PathBuf, store_size: u64) -> Result<()> {
         out: tx,
         state: Mutex::default(),
         store_lock: Mutex::default(),
+        glibc_needs: Mutex::default(),
     });
 
     let mut stdin = tokio::io::stdin();
@@ -187,6 +193,8 @@ impl Session {
                         run_dir: self.run_dir.clone(),
                         mirroring: self.mirroring,
                         docker: self.docker,
+                        glibc: crate::compat::running_glibc().map(|g| (g.0, g.1)),
+                        disk_free: disk_free(&self.root),
                     }))
                 };
                 self.reply(req, res);
@@ -431,6 +439,9 @@ impl Session {
         // Lets the agent find this test's processes inside a shared container.
         env.insert("XTEST_REQ".into(), req.to_string());
 
+        if let Some(c) = &container {
+            self.check_libc(&spec.exe, c)?;
+        }
         let ctr_name = container.as_ref().map(|c| c.name.as_str());
         let mut cmd = self.build_command(&spec.exe, &spec.args, &spec.cwd, &env, ctr_name);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -540,6 +551,47 @@ fn pump(
             }
         }
     })
+}
+
+impl Session {
+    /// Fails with an explanation if `exe` (built on the developer's machine)
+    /// can't run in the container's image because of its C library.
+    fn check_libc(&self, exe: &Path, c: &Container) -> Result<()> {
+        use crate::compat::Libc;
+        let host_exe = self.host_path(exe);
+        let needed = *self
+            .glibc_needs
+            .lock()
+            .unwrap()
+            .entry(host_exe.clone())
+            .or_insert_with(|| crate::compat::required_glibc(&host_exe).ok().flatten());
+        let Some(needed) = needed else { return Ok(()) };
+        let name = exe.file_name().unwrap_or_default().to_string_lossy();
+        match c.libc {
+            Libc::Glibc(have) if have < needed => bail!(
+                "{name} needs glibc {needed} or newer, but image `{}` has glibc {have}: \
+                 use an image with a newer glibc, or build the tests for a musl target",
+                c.image
+            ),
+            Libc::Musl => bail!(
+                "{name} needs glibc {needed}, but image `{}` uses musl: \
+                 use a glibc-based image, or build the tests for a musl target",
+                c.image
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Free space for unprivileged users on the filesystem of `path`.
+fn disk_free(path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return u64::MAX };
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return u64::MAX; // unknown: don't block anything
+    }
+    st.f_bavail as u64 * st.f_frsize as u64
 }
 
 fn kill_group(pgid: i32) {

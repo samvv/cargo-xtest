@@ -139,6 +139,25 @@ A host must have the architecture the tests are built for. To test on a
 different architecture, set `target` and point `agent` at an agent built for
 it.
 
+### Checks before a run
+
+Programs built on your machine need a C library at least as new as yours.
+Before running anything, cargo-xtest checks each host and stops with an
+explanation if:
+
+| Check | Fix |
+|---|---|
+| the host's glibc is older than the agent needs | build cargo-xtest for a musl target and set `agent` to that `xtest-agent` |
+| the host's glibc is older than the test binaries need | build the tests for a musl target (`target = "x86_64-unknown-linux-musl"`) |
+| programs can't run from `root` (a `noexec` filesystem) | set `root` to a directory where programs may run |
+| there isn't enough free space under `root` for the upload | free space, e.g. with `cargo xtest clean`, or lower `store-size` |
+| the architecture differs from the tests' | set `target`, or use another host |
+
+Environment containers are checked the same way when they start: an image
+built for another architecture, or whose glibc is older than the test binary
+needs (or that uses musl), fails the test with an explanation instead of a
+loader error.
+
 ## Values
 
 - **Durations:** `"500ms"`, `"30s"`, `"2m"`, `"1h"`, or a number of seconds.

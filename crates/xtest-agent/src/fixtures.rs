@@ -443,6 +443,20 @@ async fn start_environment(
     exclusive: bool,
 ) -> Result<Container> {
     let name = format!("xtest-{}-{id}", s.run_id);
+    // Test binaries are built for the host, so the image must be too.
+    if docker(["image", "inspect", image]).await.is_err() {
+        docker(["pull", image]).await.with_context(|| format!("pulling image `{image}`"))?;
+    }
+    let arch = docker(["image", "inspect", "-f", "{{.Architecture}}", image]).await?;
+    let arch = crate::compat::docker_arch(arch.trim());
+    if arch != std::env::consts::ARCH {
+        bail!(
+            "image `{image}` is built for {arch}, but this host and the tests are {}; \
+             use an image (or `--platform`) for {}",
+            std::env::consts::ARCH,
+            std::env::consts::ARCH
+        );
+    }
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--name".into(), name.clone()];
     args.extend(labels(s, fixture));
@@ -474,7 +488,13 @@ async fn start_environment(
             .find_map(|l| l.strip_prefix("PATH="))
             .unwrap_or("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             .to_string();
-        anyhow::Ok(Container { name: name.clone(), cgroup, exclusive, path })
+        let probe = "getconf GNU_LIBC_VERSION 2>/dev/null || ldd --version 2>&1";
+        let libc = match docker(["exec", &name, "sh", "-c", probe]).await {
+            Ok(out) => crate::compat::Libc::parse(&out),
+            // `ldd --version` exits 1 on musl, with its output on stderr.
+            Err(e) => crate::compat::Libc::parse(&format!("{e:#}")),
+        };
+        anyhow::Ok(Container { name: name.clone(), image: image.to_string(), libc, cgroup, exclusive, path })
     }
     .await;
     if inspected.is_err() {
