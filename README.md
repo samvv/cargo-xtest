@@ -63,19 +63,6 @@ env = { POSTGRES_PASSWORD = "x" }
 ready = { cmd = ["pg_isready", "-U", "postgres"], timeout = "30s" }
 export = { DATABASE_URL = "postgres://postgres:x@{host}:{port:5432}/postgres" }
 
-[fixture.k8s]
-kind = "k3d"                         # k3d cluster create / k3d cluster delete
-scope = "run"
-servers = 1                          # default 1
-agents = 1                           # default 0
-# image = "rancher/k3s:v1.31.4-k3s1"
-args = ["--no-lb"]                   # extra `k3d cluster create` arguments
-timeout = "5m"                       # for cluster creation (default 300s)
-ready = { cmd = "kubectl wait --for=condition=Ready nodes --all", timeout = "3m" }
-export = { K3D_CLUSTER = "{cluster}" }
-runner = { image = "archlinux:latest" }  # needed for `run-in`; or `build = {...}`
-# network = "mesh"                   # share a docker network with other clusters
-
 [fixture.tmpstate]
 kind = "command"
 setup = "./scripts/up.sh"            # prints {"handle": "...", "env": {...}}
@@ -91,9 +78,12 @@ slots = 4
 
 Without any `[[host]]`, tests run on this machine.
 
-See [docs/internals.md](docs/internals.md) for the filter syntax, how
-environment containers work, and k3d fixtures: templates, several
-clusters, and networking between clusters.
+More details:
+
+- [docs/internals.md](docs/internals.md): the filter syntax and how
+  environment containers work.
+- [docs/fixtures/k3d.md](docs/fixtures/k3d.md): Kubernetes clusters with k3d,
+  including several clusters and networking between them.
 
 ## Memory scheduling
 
