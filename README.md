@@ -59,6 +59,10 @@ name = "build-box"
 ssh = "ci@build-box.lan"
 ```
 
+Put your own settings, such as your test hosts, in
+`.config/xtest.local.toml` and add it to `.gitignore`. It is merged over the
+shared file; see [local overrides](docs/configuration.md#local-overrides-xtestlocaltoml).
+
 The [documentation](docs/README.md) covers the rest:
 [every configuration key](docs/configuration.md), [filters](docs/filters.md),
 [fixtures](docs/fixtures/README.md) ([Docker](docs/fixtures/docker.md),
@@ -92,7 +96,7 @@ cargo xtest [OPTIONS] [FILTERS]...
 | `--include-ignored` | Run ignored tests too |
 | `--keep-fixtures` | Keep the test-scoped fixtures of failed tests, and print how to inspect them (e.g. `docker exec -it ... sh`); see [fixtures](docs/fixtures/README.md#debugging---keep-fixtures) |
 | `--list` | List the tests that would run, with their memory estimates, then exit |
-| `--config <FILE>` | Config file to use instead of `.config/xtest.toml` in the workspace root |
+| `--config <FILE>` | Config file to use instead of `.config/xtest.toml` in the workspace root. `<name>.local.toml` next to it is merged over it. |
 
 Exit codes: 0 when all tests pass, 100 when any test fails, 1 on errors,
 130 when interrupted.

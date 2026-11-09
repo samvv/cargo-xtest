@@ -1,2 +1,3 @@
 /target
 /examples/*/target
+/examples/*/.config/xtest.local.toml

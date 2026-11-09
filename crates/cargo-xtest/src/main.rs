@@ -56,7 +56,7 @@ struct Args {
     /// Target triple to build for (overrides the profile).
     #[arg(long)]
     target: Option<String>,
-    /// Config file to use instead of `.config/xtest.toml` in the workspace root.
+    /// Config file to use instead of `.config/xtest.toml` in the workspace root (`<name>.local.toml` next to it is merged over it).
     #[arg(long)]
     config: Option<std::path::PathBuf>,
     /// Profile from `.config/xtest.toml`.
@@ -88,7 +88,7 @@ enum Cmd {
         /// Clean only these hosts.
         #[arg(long = "host")]
         hosts: Vec<String>,
-        /// Config file to use instead of `.config/xtest.toml` in the workspace root.
+        /// Config file to use instead of `.config/xtest.toml` in the workspace root (`<name>.local.toml` next to it is merged over it).
         #[arg(long)]
         config: Option<std::path::PathBuf>,
     },

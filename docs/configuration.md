@@ -1,8 +1,9 @@
 # Configuration
 
 cargo-xtest reads `.config/xtest.toml` in the workspace root, or the file
-given with `--config`. Without a config file it uses the defaults below: one
-host (this machine) and no fixtures.
+given with `--config`, and then your [local overrides](#local-overrides-xtestlocaltoml)
+if there are any. Without a config file it uses the defaults below: one host
+(this machine) and no fixtures.
 
 ```toml
 [profile.default]
@@ -24,6 +25,35 @@ export = { DATABASE_URL = "postgres://postgres:x@{host}:{port:5432}/postgres" }
 name = "build-box"
 ssh = "ci@build-box.lan"
 ```
+
+## Local overrides: `xtest.local.toml`
+
+Settings that belong to you rather than the project, such as your own test
+hosts, go in `.config/xtest.local.toml` next to the shared file. Add it to
+`.gitignore`:
+
+```gitignore
+.config/xtest.local.toml
+```
+
+```toml
+# .config/xtest.local.toml
+[[host]]
+name = "workstation"
+ssh = "me@workstation.lan"
+slots = 16
+```
+
+It uses the same format, and is merged over the shared file:
+
+| Section | Effect of the local file |
+|---|---|
+| `[[host]]` | if it has any hosts, they replace the shared ones |
+| `[profile.<name>]` | keys it sets win; its overrides apply after the shared ones |
+| `[fixture.<name>]` | a fixture it defines replaces the shared one with that name |
+
+With `--config <dir>/<name>.toml`, the local file is `<dir>/<name>.local.toml`.
+Without `--config`, either file may exist without the other.
 
 ## Profiles: `[profile.<name>]`
 

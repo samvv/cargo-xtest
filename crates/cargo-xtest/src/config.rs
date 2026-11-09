@@ -194,19 +194,55 @@ pub struct Resolved {
 pub const DEFAULT_MEMORY: u64 = 256 << 20;
 pub const DEFAULT_MEMORY_RESERVE: u64 = 512 << 20;
 
+/// `dir/xtest.toml` → `dir/xtest.local.toml`.
+fn local_path(config: &Path) -> PathBuf {
+    let stem = config.file_stem().unwrap_or_default().to_string_lossy();
+    config.with_file_name(format!("{stem}.local.toml"))
+}
+
 impl Config {
+    /// Loads `.config/xtest.toml` (or `explicit`), then merges the local
+    /// override next to it (`xtest.local.toml`, or `<name>.local.toml` for an
+    /// explicit `<name>.toml`) over it, if that exists.
     pub fn load(workspace_root: &Path, explicit: Option<&Path>) -> Result<Config> {
         let path = match explicit {
             Some(p) => p.to_owned(),
             None => workspace_root.join(".config/xtest.toml"),
         };
-        if explicit.is_none() && !path.exists() {
-            return Ok(Config::default());
+        let local = local_path(&path);
+        let mut cfg = if explicit.is_none() && !path.exists() { Config::default() } else { Self::parse(&path)? };
+        let mut shown = path.display().to_string();
+        if local.exists() {
+            cfg.merge(Self::parse(&local)?);
+            shown = format!("{shown} + {}", local.display());
         }
-        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        cfg.validate().with_context(|| format!("in {}", path.display()))?;
+        cfg.validate().with_context(|| format!("in {shown}"))?;
         Ok(cfg)
+    }
+
+    fn parse(path: &Path) -> Result<Config> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Applies a local override:
+    /// - `[[host]]`: if the local file has any, they replace the shared ones;
+    /// - `[profile.*]`: keys it sets win; its overrides apply after the shared ones;
+    /// - `[fixture.*]`: a fixture it defines replaces the one with that name.
+    fn merge(&mut self, local: Config) {
+        if !local.host.is_empty() {
+            self.host = local.host;
+        }
+        for (name, lp) in local.profile {
+            let p = self.profile.entry(name).or_default();
+            p.target = lp.target.or(p.target.take());
+            p.include = lp.include.or(p.include.take());
+            p.timeout = lp.timeout.or(p.timeout.take());
+            p.memory = lp.memory.or(p.memory.take());
+            p.memory_reserve = lp.memory_reserve.or(p.memory_reserve.take());
+            p.overrides.extend(lp.overrides);
+        }
+        self.fixture.extend(local.fixture);
     }
 
     fn validate(&self) -> Result<()> {
@@ -358,6 +394,59 @@ pub fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_override_merges_over_the_shared_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_dir = dir.path().join(".config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("xtest.toml"),
+            r#"
+            [profile.default]
+            timeout = "60s"
+            memory = "1G"
+            [[profile.default.overrides]]
+            filter = "binary(db)"
+            uses = ["pg"]
+            [fixture.pg]
+            kind = "docker"
+            image = "postgres:17"
+            [[host]]
+            name = "ci"
+            ssh = "ci@ci.lan"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            cfg_dir.join("xtest.local.toml"),
+            r#"
+            [profile.default]
+            timeout = "5m"
+            [[profile.default.overrides]]
+            filter = "binary(slow)"
+            timeout = "1h"
+            [fixture.pg]
+            kind = "docker"
+            image = "postgres:16"
+            [[host]]
+            name = "mine"
+            ssh = "me@box"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::load(dir.path(), None).unwrap();
+        assert_eq!(cfg.host.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["mine"]);
+        let p = &cfg.profile["default"];
+        assert_eq!((p.timeout.as_deref(), p.memory.as_deref()), (Some("5m"), Some("1G")));
+        assert_eq!(p.overrides.iter().map(|o| o.filter.as_str()).collect::<Vec<_>>(), ["binary(db)", "binary(slow)"]);
+        assert_eq!(cfg.fixture["pg"].image.as_deref(), Some("postgres:16"));
+
+        // A local file alone works too.
+        std::fs::remove_file(cfg_dir.join("xtest.toml")).unwrap();
+        assert_eq!(Config::load(dir.path(), None).unwrap().host[0].name, "mine");
+        assert_eq!(local_path(Path::new("/x/ci.toml")), Path::new("/x/ci.local.toml"));
+    }
 
     #[test]
     fn sizes() {
