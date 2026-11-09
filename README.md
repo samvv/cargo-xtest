@@ -91,22 +91,55 @@ More details:
 
 ## CLI
 
+### `cargo xtest`
+
+Builds the tests, runs them on the hosts and reports the results.
+
 ```
-cargo xtest [FILTERS]... [-E EXPR]... [-p PKG] [--release] [--target T]
-            [--profile P] [--host NAME]... [--ignored | --include-ignored]
-            [--keep-fixtures] [--list] [--config FILE]
-cargo xtest clean [--host NAME]... [--config FILE]
+cargo xtest [OPTIONS] [FILTERS]...
 ```
 
-A filter that is literally `clean` must be written as `-E 'test(clean)'`.
+| Flag | Description |
+|---|---|
+| `FILTERS...` | Run only tests whose name contains one of these strings |
+| `-E`, `--filter-expr <EXPR>` | Run only tests matching this [filter expression](docs/internals.md#filters), e.g. `package(db) & test(/integration/)`. Repeatable: a test runs if any expression matches |
+| `-p`, `--package <PKG>` | Test only this package. Repeatable |
+| `--workspace` | Test every package in the workspace |
+| `-F`, `--features <FEATURES>` | Comma-separated features to enable |
+| `--all-features` | Enable all features |
+| `--no-default-features` | Disable the default features |
+| `-r`, `--release` | Build in release mode |
+| `--target <TRIPLE>` | Target triple to build for (overrides the profile's `target`) |
+| `--profile <NAME>` | Profile from `.config/xtest.toml` (default: `default`) |
+| `--host <NAME>` | Run only on this host. Repeatable |
+| `--ignored` | Run only ignored tests |
+| `--include-ignored` | Run ignored tests too |
+| `--keep-fixtures` | Keep the test-scoped fixtures of failed tests, and print how to inspect them (e.g. `docker exec -it ... sh`) |
+| `--list` | List the tests that would run, with their memory estimates, then exit |
+| `--config <FILE>` | Config file to use instead of `.config/xtest.toml` in the workspace root |
 
 Exit codes: 0 when all tests pass, 100 when any test fails, 1 on errors,
 130 when interrupted.
 
-`--keep-fixtures` keeps the test-scoped fixtures of failed tests and prints
-how to inspect them (`docker exec -it ... sh`). `cargo xtest clean` removes
-them; so does deleting the run's `keep` file under `<root>/runs/` (the next
-run cleans it up).
+A filter that is literally `clean` must be written as `-E 'test(clean)'`.
+
+### `cargo xtest clean`
+
+Removes everything on the hosts that no running test run uses: kept runs and
+their fixtures, store blobs, old agent builds, cached tools and built images.
+See [docs/cleanup.md](docs/cleanup.md).
+
+```
+cargo xtest clean [OPTIONS]
+```
+
+| Flag | Description |
+|---|---|
+| `--host <NAME>` | Clean only this host. Repeatable |
+| `--config <FILE>` | Config file to use instead of `.config/xtest.toml` in the workspace root |
+
+Fixtures kept with `--keep-fixtures` can also be released one run at a time:
+delete the run's `keep` file under `<root>/runs/`, and the next run cleans it up.
 
 ## Layout
 
