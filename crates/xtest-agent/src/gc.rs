@@ -100,6 +100,19 @@ pub fn try_lock(path: &Path) -> Option<File> {
     lock(path, libc::LOCK_EX | libc::LOCK_NB)
 }
 
+/// Whether nobody holds the lock at `path`. The probe lock is released
+/// explicitly: a process forked meanwhile shares the open file, so merely
+/// closing ours would leave the lock held until that child calls `exec`.
+fn is_unlocked(path: &Path) -> bool {
+    match try_lock(path) {
+        Some(f) => {
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+            true
+        }
+        None => false,
+    }
+}
+
 /// Takes a `flock` of the given kind on `path` (created if needed).
 pub fn lock(path: &Path, op: libc::c_int) -> Option<File> {
     let f = File::options().create(true).truncate(false).write(true).open(path).ok()?;
@@ -134,7 +147,7 @@ pub fn collect(root: &Path, docker: bool, policy: &Policy) -> Report {
             let dir = e.path();
             let lock = dir.join("lock");
             let unlocked = if lock.exists() {
-                try_lock(&lock).is_some()
+                is_unlocked(&lock)
             } else {
                 // A brand-new run creates its lock right after its directory.
                 e.metadata().map(|m| age(&m) > Duration::from_secs(60)).unwrap_or(false)
