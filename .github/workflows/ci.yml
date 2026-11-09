@@ -43,7 +43,12 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Install k3d
         if: matrix.profile == 'k8s'
-        run: curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          # The k8s profile runs several clusters at once; every k3s node uses
+          # many inotify instances, more than Ubuntu's default 128 allows.
+          sudo sysctl -w fs.inotify.max_user_instances=1024
+          sudo sysctl -w fs.inotify.max_user_watches=1048576
       - name: Build cargo-xtest
         run: |
           cargo build
