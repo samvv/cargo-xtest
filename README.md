@@ -91,33 +91,9 @@ slots = 4
 
 Without any `[[host]]`, tests run on this machine.
 
-**Filters** (`-E` and `filter =`): `package()`, `binary()`, `kind()`,
-`test()`, `all()`, `none()`, combined with `&`, `|`, `!` and parentheses.
-Matchers: `=exact`, `~substring`, `/regex/`. Plain `test(x)` matches a
-substring; plain values for the other predicates match exactly.
-
-**k3d fixtures** give tests `KUBECONFIG` and a `kubectl` on `PATH` that
-matches the cluster: the static k3s binary from the node image, cached once
-per image on the host. With `uses`, tests run on the host; with `run-in`, they
-run in a `runner` container (host network, sandbox at its original paths).
-`export` and `ready.cmd` (which runs on the host, with that `kubectl`, until
-it succeeds) can use `{cluster}`, `{context}` (`k3d-<cluster>`),
-`{kubeconfig}`, `{network}`, and node IPs: `{server-ip}` (first server),
-`{server:N}` and `{agent:N}`. A test that uses several clusters gets all
-their kubeconfigs in `KUBECONFIG` (`a:b`); select one with `--context`.
-
-Each cluster gets its own docker network, and docker blocks traffic between
-networks. Clusters that set the same `network = "name"` share one network
-instead (`xt-<run id>-<name>`, created by the agent and removed at the end
-of the run), so a pod in one cluster can reach `{server-ip}:<NodePort>` of
-the other. The host needs
-`k3d` and docker. Clusters are named `xt<lease>-<run id>` and labeled,
-so the agent deletes leftover clusters and networks on its next start.
-
-**Environment containers** run as your uid, with `--network host`, the
-sandbox mounted at its original paths, and `sleep infinity` as entrypoint.
-The test binary is built on your machine, so the image needs a glibc at
-least as new as yours, or build for a musl target.
+See [docs/internals.md](docs/internals.md) for the filter syntax, how
+environment containers work, and k3d fixtures: templates, several
+clusters, and networking between clusters.
 
 ## Memory scheduling
 
