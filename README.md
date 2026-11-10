@@ -46,34 +46,35 @@ cargo-xtest reads `.config/xtest.toml` in the workspace root. Without it,
 tests run on this machine with no fixtures.
 
 ```toml
-[profile.default]
-timeout = "60s"
-
-# Tests in tests/db.rs get a Postgres container next to them.
-[[profile.default.overrides]]
-filter = "binary(db)"
-uses = ["pg"]
-
-# This test runs inside a container with borg installed.
-[[profile.default.overrides]]
-filter = "test(=backup::tests::creates_archive)"
-run-in = "borg"
-
+# A Postgres container, shared by all tests of the run.
 [fixture.pg]
 kind = "docker"
 image = "postgres:17"
 scope = "run"
 env = { POSTGRES_PASSWORD = "x" }
-ready = { cmd = ["pg_isready", "-U", "postgres"], timeout = "30s" }
+ready = { cmd = ["pg_isready", "-U", "postgres"] }
 export = { DATABASE_URL = "postgres://postgres:x@{host}:{port:5432}/postgres" }
 
-[fixture.borg]
-kind = "docker"
-build = { dockerfile = "tests/docker/borg.Dockerfile" }
+# The tests in tests/db.rs use it.
+[[profile.default.overrides]]
+filter = "binary(db)"
+uses = ["pg"]
 
+# Run the tests on build-box, over SSH, instead of locally.
 [[host]]
 name = "build-box"
 ssh = "ci@build-box.lan"
+```
+
+The tests find the database through the exported variable:
+
+```rust
+// tests/db.rs
+#[test]
+fn connects() {
+    let url = std::env::var("DATABASE_URL").unwrap();
+    // ...
+}
 ```
 
 Put your own settings, such as your test hosts, in
@@ -83,7 +84,7 @@ shared file; see [local overrides](docs/configuration.md#local-overrides-xtestlo
 The [documentation](docs/README.md) covers the rest:
 [every configuration key](docs/configuration.md), [filters](docs/filters.md),
 [fixtures](docs/fixtures/README.md) ([Docker](docs/fixtures/docker.md),
-[command](docs/fixtures/command.md), [k3d](docs/fixtures/k3d.md)),
+[command](docs/fixtures/command.md), [k3d](docs/fixtures/k3d.md), [Rust](docs/fixtures/rust.md)),
 [memory scheduling](docs/memory-scheduling.md) and [cleanup](docs/cleanup.md).
 
 ## Writing tests
