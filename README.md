@@ -10,6 +10,62 @@ such as Docker containers.
 - **Isolation:** one process per test, with its own temp directory and timeout.
 - **Self-cleaning:** removes leftovers after crashes and keeps caches under a size cap.
 
+```rust
+use xtest::fixture::{Docker, Ready, Setup, Teardown};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Postgres {
+    url: String,
+}
+
+/// One Postgres container for the whole run.
+#[xtest::fixture(scope = "run", memory = "256M")]
+async fn postgres(cx: &mut Setup) -> xtest::Result<Postgres> {
+    let c = cx
+        .docker(
+            Docker::image("postgres:17")
+                .env("POSTGRES_PASSWORD", "x")
+                .port(5432)
+                .ready(Ready::cmd(["pg_isready", "-U", "postgres"])),
+        )
+        .await?;
+    Ok(Postgres { url: format!("postgres://postgres:x@{}/postgres", c.addr(5432)) })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Db {
+    url: String,
+    name: String,
+    admin_url: String,
+}
+
+/// A fresh, migrated database for every test.
+#[xtest::fixture]
+async fn db(cx: &mut Setup, postgres: &Postgres) -> xtest::Result<Db> {
+    let name = format!("test_{}", cx.instance_id().replace('-', "_"));
+    myapp::db::create_database(&postgres.url, &name).await?;
+    let url = postgres.url.replace("/postgres", &format!("/{name}"));
+    myapp::db::migrate(&url).await?;
+    Ok(Db { url, name, admin_url: postgres.url.clone() })
+}
+
+#[xtest::teardown(db)]
+async fn drop_db(cx: &mut Teardown, db: Db) -> xtest::Result<()> {
+    if cx.failed() {
+        cx.attach("users.txt", myapp::db::dump_table(&db.url, "users").await?)?;
+    }
+    myapp::db::drop_database(&db.admin_url, &db.name).await?;
+    Ok(())
+}
+
+#[xtest::test]
+fn signs_up(db: &Db) {
+    let app = myapp::App::connect(&db.url).unwrap();
+    app.sign_up("alice@example.com").unwrap();
+    assert!(app.user("alice@example.com").is_some());
+}
+```
+
 ## Installation
 
 ```
@@ -94,17 +150,6 @@ Plain `#[test]` functions work as they are. The optional `xtest` crate adds
 and [fixtures written in Rust](docs/fixtures/rust.md): async functions that
 start containers, clusters and processes through cargo-xtest, with your own
 setup and teardown logic around them.
-
-```rust
-#[xtest::fixture(scope = "run")]
-async fn redis(cx: &mut Setup) -> xtest::Result<Redis> {
-    let c = cx.docker(Docker::image("redis:7-alpine").port(6379).ready(Ready::tcp(6379))).await?;
-    Ok(Redis { addr: c.addr(6379) })
-}
-
-#[xtest::test]
-fn pings(redis: &Redis) { /* ... */ }
-```
 
 ## CLI
 
