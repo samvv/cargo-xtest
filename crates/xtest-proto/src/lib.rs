@@ -13,8 +13,11 @@ use std::time::Duration;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub mod fx;
+pub mod meta;
+
 /// Bumped whenever the messages below change incompatibly.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 /// Largest frame we accept. Blob uploads are chunked well below this.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -81,17 +84,25 @@ pub enum Request {
         /// Used by a single test only (test scope). Lets the agent measure
         /// a container's whole peak memory as that test's peak.
         exclusive: bool,
+        /// Leases of the fixtures this one depends on (Rust fixtures only).
+        /// They are set up already; their values and env vars are passed on.
+        deps: Vec<u64>,
     },
     /// Current memory situation. Answered with [`Reply::Memory`].
     Memory,
     /// Answered with [`Reply::TornDown`].
     Teardown {
         lease: u64,
+        /// Whether a test that used the lease failed.
+        failed: bool,
     },
     /// End the session: kill processes, tear down every lease except `keep`,
-    /// and remove the run directory (unless something is kept).
+    /// and remove the run directory (unless something is kept). Answered
+    /// with [`Reply::ShutDown`].
     Shutdown {
         keep: Vec<u64>,
+        /// Leases used by a test that failed.
+        failed: Vec<u64>,
     },
 }
 
@@ -131,6 +142,31 @@ pub enum FixtureSpec {
     Docker(DockerSpec),
     Command(CommandSpec),
     K3d(K3dSpec),
+    Rust(RustSpec),
+}
+
+/// A fixture written in Rust with `#[xtest::fixture]`. Its setup is a hidden
+/// ignored test in a test binary; the agent runs it with `--exact`, and the
+/// fixture asks the agent for containers and processes over a socket (see
+/// [`fx`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RustSpec {
+    /// The fixture's id (`<file>#<name>`): the key of its value in
+    /// `XTEST_FIXTURES`.
+    pub id: String,
+    /// Test binary that contains the fixture.
+    pub exe: PathBuf,
+    /// Name of the hidden setup test.
+    pub setup_test: String,
+    /// Name of the hidden teardown test, if the fixture has one.
+    pub teardown_test: Option<String>,
+    /// Directory the fixture runs in, and env vars cargo would set for the binary.
+    pub cwd: PathBuf,
+    pub env: BTreeMap<String, String>,
+    /// How long setup may take.
+    pub timeout: Duration,
+    /// Tests run inside the container the fixture makes (`run-in`).
+    pub environment: bool,
 }
 
 /// A Kubernetes cluster made with `k3d cluster create`. Tests get its
@@ -232,7 +268,28 @@ pub enum Reply {
     TornDown {
         /// Peak memory of the fixture, if the agent could measure it.
         peak: Option<u64>,
+        report: TeardownReport,
     },
+    /// Reply to [`Request::Shutdown`]: what tearing down the remaining leases said.
+    ShutDown {
+        reports: Vec<(u64, TeardownReport)>,
+    },
+}
+
+/// What a fixture's teardown produced, for the user.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeardownReport {
+    /// Why tearing down failed, if it did. The fixture's resources are
+    /// removed anyway.
+    pub error: Option<String>,
+    /// Files the teardown function attached (`Teardown::attach`).
+    pub attachments: Vec<(String, Vec<u8>)>,
+}
+
+impl TeardownReport {
+    pub fn is_empty(&self) -> bool {
+        self.error.is_none() && self.attachments.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

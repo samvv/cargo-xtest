@@ -45,6 +45,28 @@ or as a local process) and talks to it over the agent's stdin and stdout.
    still running, tears down fixtures (except kept ones), and removes the run
    directory.
 
+## Rust fixtures
+
+`#[xtest::test]`, `#[xtest::fixture]` and `#[xtest::teardown]` each embed a
+record in the binary: a `#[used]` static byte array built at compile time
+(`xtest_proto::meta`), which the generated code refers to so the linker keeps
+it. After the build, the controller scans every test binary for these
+records: which tests use which fixtures, and each fixture's scope,
+dependencies and memory. Nothing has to run for that.
+
+A fixture's setup and teardown are hidden ignored tests
+(`__xtest_fixture_<name>`, `__xtest_teardown_<name>`), left out of the test
+list. To set a fixture up, the agent runs its setup test with `--exact` and a
+Unix socket in `XTEST_SOCKET`. The fixture asks for containers, clusters and
+processes over that socket (`xtest_proto::fx`); the agent creates them with
+its usual code, as *parts* of the fixture's lease, and finally gets the
+fixture's value as JSON. Tests get the values of their fixtures in a JSON
+file named by `XTEST_FIXTURES`.
+
+Processes a fixture runs carry `XTEST_RUN=<run id>`, and `cx.cleanup`
+commands are saved under `<run>/cleanup/`, so garbage collection can kill
+and clean up after a run whose agent crashed.
+
 ## Test order
 
 The queue is ordered by how long each test took in the last run, longest

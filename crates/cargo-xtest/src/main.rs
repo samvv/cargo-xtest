@@ -9,6 +9,7 @@ mod filter;
 mod hashcache;
 mod history;
 mod runner;
+mod rust_fixtures;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -183,7 +184,10 @@ fn run(args: Args) -> Result<ExitCode> {
     })?;
     let files = files::collect(&ws.root, &ws.target_dir, &profile.include, &built.executables, args.rehash)?;
     let mut history = history::History::load(&ws.target_dir);
-    let fixtures = fixture_defs(&cfg, &ws.root, &files, &history)?;
+    let mut fixtures = fixture_defs(&cfg, &ws.root, &files, &history)?;
+    let bins: Vec<Arc<cargo::TestBinary>> = built.tests.iter().cloned().map(Arc::new).collect();
+    let rust = rust_fixtures::collect(&bins)?;
+    add_rust_fixtures(&mut fixtures, &rust, &history);
 
     let width = hosts.iter().map(|h| h.name.len()).max().unwrap_or(5);
     let mut reporter = Reporter::new(width);
@@ -240,6 +244,7 @@ fn run(args: Args) -> Result<ExitCode> {
             })
             .collect();
 
+        let failed_leases: Arc<std::sync::Mutex<std::collections::BTreeSet<u64>>> = Default::default();
         let result = async {
             if let Some(e) = first_err {
                 return Err(e);
@@ -249,8 +254,9 @@ fn run(args: Args) -> Result<ExitCode> {
                 check_host(&h.agent, target.as_deref(), &reporter)?;
                 check_glibc(&h.agent, &built.executables, &needs)?;
             }
-            let bins: Vec<_> = built.tests.into_iter().map(Arc::new).collect();
             let found = runner::discover(&hosts[0].agent, &bins, &reporter).await?;
+            // Fixture setups and teardowns are hidden tests; they never run as tests.
+            let found: Vec<_> = found.into_iter().filter(|(_, name, _)| !rust_fixtures::is_hidden(name)).collect();
 
             let mut cases = Vec::new();
             let mut skipped = 0;
@@ -298,6 +304,21 @@ fn run(args: Args) -> Result<ExitCode> {
                 if let Some(r) = args.retries {
                     case.retries = r;
                 }
+                // A #[xtest::test] with fixtures is #[ignore]d for plain
+                // `cargo test`; only the user's own #[ignore] counts here.
+                let meta = rust.tests.get(&(bin.exe.clone(), name.clone()));
+                let ignored = meta.map_or(ignored, |m| m.ignored);
+                if let Some(m) = meta {
+                    for id in rust_fixtures::closure(&rust, &m.fixtures).with_context(|| format!("test {}", case.display()))? {
+                        if rust.fixtures[&id].meta.environment {
+                            if let Some(prev) = case.run_in.replace(id.clone()) {
+                                bail!("test {} would run in two environments: `{prev}` and `{id}`", case.display());
+                            }
+                        } else {
+                            case.uses.push(id);
+                        }
+                    }
+                }
                 let selected = (args.filters.is_empty() || args.filters.iter().any(|f| name.contains(f.as_str())))
                     && (exprs.is_empty() || exprs.iter().any(|e| e.matches(&subject)))
                     && if args.ignored { ignored } else { !ignored || include_ignored };
@@ -324,10 +345,11 @@ fn run(args: Args) -> Result<ExitCode> {
                         None => " [duration: unknown]".to_string(),
                     };
                     if let Some(e) = &c.run_in {
-                        extra += &format!(" [run-in: {e}]");
+                        extra += &format!(" [run-in: {}]", runner::fixture_display(e));
                     }
                     if !c.uses.is_empty() {
-                        extra += &format!(" [uses: {}]", c.uses.join(", "));
+                        let uses: Vec<String> = c.uses.iter().map(|u| runner::fixture_display(u)).collect();
+                        extra += &format!(" [uses: {}]", uses.join(", "));
                     }
                     println!("{}{extra}", c.display());
                 }
@@ -336,7 +358,12 @@ fn run(args: Args) -> Result<ExitCode> {
                 used.dedup();
                 for name in used {
                     let f = &fixtures[name];
-                    println!("fixture {name} [memory: {} ({})]", format_size(f.memory), source(f.memory_source));
+                    println!(
+                        "fixture {} [memory: {} ({})]",
+                        runner::fixture_display(name),
+                        format_size(f.memory),
+                        source(f.memory_source)
+                    );
                 }
                 return Ok(None);
             }
@@ -358,6 +385,7 @@ fn run(args: Args) -> Result<ExitCode> {
                 measured: Default::default(),
                 fail_fast: args.fail_fast,
                 stopped: Default::default(),
+                failed_leases: failed_leases.clone(),
             });
             let not_run;
             tokio::select! {
@@ -382,7 +410,7 @@ fn run(args: Args) -> Result<ExitCode> {
                 .filter_map(|(k, v)| Some((k.strip_prefix("fixture:")?.to_string(), *v)))
                 .collect();
             for (name, peak) in fixture_peaks {
-                ctx.reporter.status("Fixture", &format!("{name}: peak {}", format_size(peak)));
+                ctx.reporter.status("Fixture", &format!("{}: peak {}", runner::fixture_display(&name), format_size(peak)));
             }
             let ok = ctx.reporter.summary(skipped, not_run);
             let measured = std::mem::take(&mut *ctx.measured.lock().unwrap());
@@ -394,13 +422,23 @@ fn run(args: Args) -> Result<ExitCode> {
         .await;
 
         // Always shut agents down, so they tear down fixtures and sandboxes.
+        let failed: Vec<u64> = failed_leases.lock().unwrap().iter().copied().collect();
         for h in &hosts {
             let kept = std::mem::take(&mut *h.kept.lock().unwrap());
             for (_, msg) in &kept {
                 eprintln!("{msg}");
             }
-            if let Err(e) = h.agent.shutdown(kept.into_iter().map(|(id, _)| id).collect()).await {
-                eprintln!("warning: {e:#}");
+            match h.agent.shutdown(kept.into_iter().map(|(id, _)| id).collect(), failed.clone()).await {
+                Ok(reports) => {
+                    let names = h.lease_names.lock().unwrap();
+                    for (lease, report) in reports {
+                        let fixture = names.get(&lease).cloned().unwrap_or_else(|| format!("lease {lease}"));
+                        for (_, text) in runner::report_output(&fixture, &report) {
+                            eprint!("{}", String::from_utf8_lossy(&text));
+                        }
+                    }
+                }
+                Err(e) => eprintln!("warning: {e:#}"),
             }
         }
         Ok(result?.unwrap_or(ExitCode::SUCCESS))
@@ -496,6 +534,28 @@ fn default_fixture_memory(f: &config::Fixture) -> u64 {
     }
 }
 
+/// Adds the fixtures written in Rust. Their memory: `memory` in the
+/// attribute, else the peak their containers had last time, else nothing:
+/// unlike a TOML fixture, nothing says what a Rust fixture starts.
+fn add_rust_fixtures(fixtures: &mut HashMap<String, FixtureDef>, rust: &rust_fixtures::Collected, history: &history::History) {
+    for (id, f) in &rust.fixtures {
+        let (memory, memory_source) = match (f.meta.memory, history.peak(&runner::fixture_history_key(id))) {
+            (Some(m), _) => (m, MemorySource::Config),
+            (None, Some(peak)) => (peak, MemorySource::Measured),
+            (None, None) => (0, MemorySource::Default),
+        };
+        let def = FixtureDef {
+            scope: f.meta.scope,
+            spec: FixtureSpec::Rust(f.spec_for(&f.bins[0].0)),
+            memory,
+            memory_source,
+            deps: f.meta.deps.clone(),
+            rust: Some(f.clone()),
+        };
+        fixtures.insert(id.clone(), def);
+    }
+}
+
 fn fixture_defs(
     cfg: &Config,
     ws_root: &std::path::Path,
@@ -556,7 +616,7 @@ fn fixture_defs(
             (None, Some(peak)) => (peak, MemorySource::Measured),
             (None, None) => (default_fixture_memory(f), MemorySource::Default),
         };
-        out.insert(name.clone(), FixtureDef { scope: f.scope, spec, memory, memory_source });
+        out.insert(name.clone(), FixtureDef { scope: f.scope, spec, memory, memory_source, deps: vec![], rust: None });
     }
     Ok(out)
 }

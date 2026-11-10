@@ -89,8 +89,21 @@ The [documentation](docs/README.md) covers the rest:
 ## Writing tests
 
 Plain `#[test]` functions work as they are. The optional `xtest` crate adds
-[`#[xtest::test]`](docs/xtest-test.md), a drop-in replacement for `#[test]`
-that will be the base for declaring fixtures in code.
+[`#[xtest::test]`](docs/xtest-test.md), a drop-in replacement for `#[test]`,
+and [fixtures written in Rust](docs/fixtures/rust.md): async functions that
+start containers, clusters and processes through cargo-xtest, with your own
+setup and teardown logic around them.
+
+```rust
+#[xtest::fixture(scope = "run")]
+async fn redis(cx: &mut Setup) -> xtest::Result<Redis> {
+    let c = cx.docker(Docker::image("redis:7-alpine").port(6379).ready(Ready::tcp(6379))).await?;
+    Ok(Redis { addr: c.addr(6379) })
+}
+
+#[xtest::test]
+fn pings(redis: &Redis) { /* ... */ }
+```
 
 ## CLI
 

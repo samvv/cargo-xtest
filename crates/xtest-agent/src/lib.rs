@@ -5,6 +5,7 @@ pub mod compat;
 mod fixtures;
 pub mod gc;
 pub mod memory;
+mod rust_fixture;
 pub mod sandbox;
 mod session;
 pub mod store;

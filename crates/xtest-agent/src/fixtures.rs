@@ -1,4 +1,6 @@
-//! Fixture kinds: Docker containers, k3d clusters and user-supplied commands.
+//! Fixture kinds: Docker containers, k3d clusters, user-supplied commands,
+//! and Rust fixtures (see [`crate::rust_fixture`]), which are built from the
+//! first two.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,9 +15,21 @@ use xtest_proto::*;
 use crate::memory;
 use crate::session::{Container, Lease, LeaseKind, Session};
 
-pub async fn setup(s: &Session, id: u64, name: &str, role: Role, spec: FixtureSpec, exclusive: bool) -> Result<Reply> {
+pub async fn setup(
+    s: &Session,
+    id: u64,
+    name: &str,
+    role: Role,
+    spec: FixtureSpec,
+    exclusive: bool,
+    deps: &[u64],
+) -> Result<Reply> {
     let (lease, debug_hint) = match spec {
-        FixtureSpec::Docker(d) => docker_setup(s, id, name, role, d, exclusive).await?,
+        FixtureSpec::Docker(d) => {
+            let (lease, hint, _) = docker_setup(s, id, name, role, d, exclusive).await?;
+            (lease, hint)
+        }
+        FixtureSpec::Rust(r) => crate::rust_fixture::setup(s, id, name, r, exclusive, deps).await?,
         FixtureSpec::K3d(k) => k3d_setup(s, id, name, role, k, exclusive).await?,
         FixtureSpec::Command(c) => {
             if role == Role::Environment {
@@ -29,8 +43,17 @@ pub async fn setup(s: &Session, id: u64, name: &str, role: Role, spec: FixtureSp
     Ok(Reply::Lease { env, debug_hint })
 }
 
-pub async fn teardown(s: &Session, lease: Lease) {
+/// Removes what a lease holds. Only Rust fixtures have something to report.
+pub async fn teardown(s: &Session, lease: Lease, failed: bool) -> TeardownReport {
     match lease.kind {
+        LeaseKind::Rust(r) => return Box::pin(crate::rust_fixture::teardown(s, *r, lease.value, failed)).await,
+        LeaseKind::Process(mut child) => {
+            if let Some(pid) = child.id() {
+                crate::session::kill_group(pid as i32);
+            }
+            let _ = child.wait().await;
+        }
+        LeaseKind::Cleanup(file) => crate::rust_fixture::run_cleanup(&file),
         LeaseKind::Container(name) => {
             let _ = docker(["rm", "-f", &name]).await;
         }
@@ -54,9 +77,10 @@ pub async fn teardown(s: &Session, lease: Lease) {
         }
         LeaseKind::Command { teardown: None, .. } => {}
     }
+    TeardownReport::default()
 }
 
-async fn docker<I, S>(args: I) -> Result<String>
+pub(crate) async fn docker<I, S>(args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
@@ -85,7 +109,7 @@ where
 }
 
 /// The last lines of a command's output, for error messages.
-fn tail(stdout: &[u8], stderr: &[u8]) -> String {
+pub(crate) fn tail(stdout: &[u8], stderr: &[u8]) -> String {
     let text = format!("{}{}", String::from_utf8_lossy(stdout), String::from_utf8_lossy(stderr));
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(30)..].join("\n")
@@ -97,7 +121,7 @@ pub fn k3d_cluster_name(run_id: &str, lease: u64) -> String {
     format!("xt{lease}-{run_id}")
 }
 
-async fn k3d_setup(
+pub(crate) async fn k3d_setup(
     s: &Session,
     id: u64,
     fixture: &str,
@@ -156,7 +180,7 @@ async fn k3d_setup(
         let vars = k3d_vars(&cluster, &kubeconfig, network.as_deref()).await;
         let bin = provide_kubectl(s, &cluster, id).await.context("providing kubectl")?;
         let env = BTreeMap::from([("KUBECONFIG".to_string(), kubeconfig.display().to_string())]);
-        let lease = Lease { kind: LeaseKind::K3d { cluster: cluster.clone(), runner: None }, env, container: None, path: vec![bin], memory: None };
+        let lease = Lease { env, path: vec![bin], ..Lease::new(LeaseKind::K3d { cluster: cluster.clone(), runner: None }) };
         if let Some(r) = &k.ready {
             let cmd: Vec<String> = r.cmd.iter().flatten().map(|a| fill(a, &vars)).collect::<Result<_>>()?;
             let mut env = lease.env.clone();
@@ -239,15 +263,15 @@ pub async fn remove_networks(s: &Session) {
 }
 
 /// Values for k3d templates, and why node IPs are missing if they are.
-struct Vars {
-    values: BTreeMap<String, String>,
+pub(crate) struct Vars {
+    pub values: BTreeMap<String, String>,
     nodes_error: Option<String>,
 }
 
 /// Values for the k3d templates: names, paths and node IPs on the cluster's
 /// network. Failing to look up IPs (e.g. the cluster uses a network of its own
 /// via `args`) is only an error once a template needs them.
-async fn k3d_vars(cluster: &str, kubeconfig: &Path, network: Option<&str>) -> Vars {
+pub(crate) async fn k3d_vars(cluster: &str, kubeconfig: &Path, network: Option<&str>) -> Vars {
     let net = network.map(String::from).unwrap_or_else(|| format!("k3d-{cluster}"));
     let mut values = BTreeMap::from([
         ("cluster".to_string(), cluster.to_string()),
@@ -388,11 +412,13 @@ async fn container_cgroup(name: &str) -> Option<std::path::PathBuf> {
     pid.trim().parse().ok().and_then(memory::cgroup_of)
 }
 
-/// Pulls or builds an image; returns the name to run.
+/// Pulls or builds an image; returns the name to run. A build without a tag
+/// (from a Rust fixture) is tagged with a hash of its Dockerfile and context.
 async fn ensure_image(s: &Session, image: &ImageSource) -> Result<String> {
     Ok(match image {
         ImageSource::Pull(image) => image.clone(),
         ImageSource::Build { dockerfile, context, tag } => {
+            let tag = &if tag.is_empty() { build_tag(s, dockerfile, context)? } else { tag.clone() };
             // Marks the image as used, so GC keeps it (see `gc::collect_images`).
             let marker = crate::gc::image_marker(&s.root, tag);
             std::fs::create_dir_all(marker.parent().unwrap())?;
@@ -503,14 +529,46 @@ async fn start_environment(
     inspected
 }
 
-async fn docker_setup(
+/// Tag for an image built from `dockerfile` and `context` (as the tests see
+/// them): a hash of their contents, so a changed file means a new build.
+fn build_tag(s: &Session, dockerfile: &Path, context: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let df = s.host_path(dockerfile);
+    let ctx = s.host_path(context);
+    let mut h = Sha256::new();
+    h.update(std::fs::read(&df).with_context(|| format!("reading {}", dockerfile.display()))?);
+    let mut files = Vec::new();
+    let mut dirs = vec![ctx.clone()];
+    while let Some(dir) = dirs.pop() {
+        for e in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+            let e = e?;
+            if e.file_type()?.is_dir() {
+                dirs.push(e.path());
+            } else {
+                files.push(e.path());
+            }
+        }
+    }
+    files.sort();
+    for f in files {
+        h.update(f.strip_prefix(&ctx).unwrap_or(&f).as_os_str().as_encoded_bytes());
+        h.update(std::fs::read(&f).unwrap_or_default());
+    }
+    let name = dockerfile.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let repo: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
+    Ok(format!("xtest/{}:{}", if repo.is_empty() { "image" } else { &repo }, &hex::encode(h.finalize())[..16]))
+}
+
+/// Starts a container. Returns the lease, a debug hint, and the host port of
+/// each published container port.
+pub(crate) async fn docker_setup(
     s: &Session,
     id: u64,
     fixture: &str,
     role: Role,
     d: DockerSpec,
     exclusive: bool,
-) -> Result<(Lease, Option<String>)> {
+) -> Result<(Lease, Option<String>, BTreeMap<u16, u16>)> {
     if !s.docker {
         bail!("fixture `{fixture}` needs docker, which is not available on this host");
     }
@@ -527,8 +585,8 @@ async fn docker_setup(
             }
         }
         let hint = format!("docker exec -it {} sh", c.name);
-        let lease = Lease { kind: LeaseKind::Container(c.name.clone()), env: BTreeMap::new(), container: Some(c), path: vec![], memory: None };
-        return Ok((lease, Some(hint)));
+        let lease = Lease { container: Some(c.clone()), ..Lease::new(LeaseKind::Container(c.name)) };
+        return Ok((lease, Some(hint), BTreeMap::new()));
     }
 
     let name = format!("xtest-{}-{id}", s.run_id);
@@ -561,14 +619,14 @@ async fn docker_setup(
             wait_ready(&name, r, &mapped).await?;
         }
         let env = d.export.iter().map(|(k, v)| (k.clone(), render(v, &mapped))).collect();
-        anyhow::Ok(env)
+        anyhow::Ok((env, mapped))
     }
     .await;
     match started {
-        Ok(env) => {
+        Ok((env, mapped)) => {
             let hint = format!("docker logs {name}");
             let memory = container_cgroup(&name).await.map(|cg| memory::FixtureMemory::watch(vec![cg]));
-            Ok((Lease { kind: LeaseKind::Container(name), env, container: None, path: vec![], memory }, Some(hint)))
+            Ok((Lease { env, memory, ..Lease::new(LeaseKind::Container(name)) }, Some(hint), mapped))
         }
         Err(e) => {
             let _ = docker(["rm", "-f", &name]).await;
@@ -640,7 +698,7 @@ async fn command_setup(s: &Session, c: CommandSpec) -> Result<Lease> {
     };
     let handle = parsed.handle.unwrap_or_default();
     let teardown = c.teardown.map(|t| t.replace("{handle}", &shell_quote(&handle)));
-    Ok(Lease { kind: LeaseKind::Command { teardown, cwd: c.cwd }, env: parsed.env, container: None, path: vec![], memory: None })
+    Ok(Lease { env: parsed.env, ..Lease::new(LeaseKind::Command { teardown, cwd: c.cwd }) })
 }
 
 fn shell_quote(s: &str) -> String {

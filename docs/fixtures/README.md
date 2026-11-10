@@ -5,6 +5,10 @@ Kubernetes cluster, a temporary directory made by a script. The agent on the
 test's host sets fixtures up when the first test needs them and always tears
 them down afterwards, even if the controller dies.
 
+Fixtures are defined in `.config/xtest.toml`, as below, or
+[in Rust](rust.md), next to the tests, where they can run your own setup and
+teardown code around the same building blocks.
+
 ```toml
 [fixture.pg]
 kind = "docker"
@@ -24,6 +28,7 @@ uses = ["pg"]
 | `docker` | a Docker container, from an image or a Dockerfile | [docker.md](docker.md) |
 | `command` | your own setup and teardown commands | [command.md](command.md) |
 | `k3d` | a Kubernetes cluster made with k3d | [k3d.md](k3d.md) |
+| (Rust) | an `#[xtest::fixture]` function, built from the kinds above and your own code | [rust.md](rust.md) |
 
 ## Services and environments
 

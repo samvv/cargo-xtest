@@ -73,3 +73,8 @@ scope = "run"
 network = "mesh"
 args = ["--no-lb"]
 export = { B_CONTEXT = "{context}", B_SERVER_IP = "{server-ip}" }
+
+# Rust fixtures need no override to be used; this only runs the ignored tests.
+[[profile.k8s.overrides]]
+filter = "binary(k8s_rust)"
+include-ignored = true

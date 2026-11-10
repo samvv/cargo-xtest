@@ -121,6 +121,11 @@ impl FixtureMemory {
         FixtureUsage { current, peak }
     }
 
+    /// The cgroups this watches.
+    pub fn cgroups(&self) -> &[PathBuf] {
+        &self.cgroups
+    }
+
     pub fn usage(&self) -> FixtureUsage {
         FixtureUsage { current: self.current.load(Ordering::Relaxed), peak: self.peak.load(Ordering::Relaxed) }
     }

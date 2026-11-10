@@ -286,12 +286,17 @@ impl Agent {
         }
     }
 
-    pub async fn shutdown(&self, keep: Vec<u64>) -> Result<()> {
-        let res = tokio::time::timeout(Duration::from_secs(60), self.request(Request::Shutdown { keep })).await;
+    /// Ends the session. Returns what tearing down the remaining fixtures
+    /// reported, by lease.
+    pub async fn shutdown(&self, keep: Vec<u64>, failed: Vec<u64>) -> Result<Vec<(u64, TeardownReport)>> {
+        // Teardown functions may take a while each.
+        let res = tokio::time::timeout(Duration::from_secs(600), self.request(Request::Shutdown { keep, failed })).await;
         let mut child = self.child.lock().await;
         let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
         match res {
-            Ok(r) => r.map(|_| ()),
+            Ok(Ok(Reply::ShutDown { reports })) => Ok(reports),
+            Ok(Ok(other)) => bail!("unexpected reply to shutdown: {other:?}"),
+            Ok(Err(e)) => Err(e),
             Err(_) => bail!("agent on `{}` did not shut down in time", self.name),
         }
     }

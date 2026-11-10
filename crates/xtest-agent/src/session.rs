@@ -36,6 +36,9 @@ pub struct Session {
     /// Shared store lock, held from `HaveBlobs` until `Materialize` is done,
     /// so garbage collection can't evict blobs this run is about to link.
     store_lock: Mutex<Option<fs::File>>,
+    /// Ids for what Rust fixtures create (containers, clusters), far above
+    /// the controller's lease ids so names never clash.
+    next_part: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -64,6 +67,14 @@ pub struct Lease {
     pub path: Vec<PathBuf>,
     /// The fixture's own memory (its containers, not the tests in them).
     pub memory: Option<Arc<memory::FixtureMemory>>,
+    /// A Rust fixture's id and value, handed to the tests that use it.
+    pub value: Option<(String, serde_json::Value)>,
+}
+
+impl Lease {
+    pub fn new(kind: LeaseKind) -> Lease {
+        Lease { kind, env: BTreeMap::new(), container: None, path: vec![], memory: None, value: None }
+    }
 }
 
 #[derive(Clone)]
@@ -84,6 +95,13 @@ pub enum LeaseKind {
     /// A k3d cluster, and the runner container tests use it from (environment role).
     K3d { cluster: String, runner: Option<String> },
     Command { teardown: Option<String>, cwd: PathBuf },
+    /// A Rust fixture and everything it asked the agent for.
+    Rust(Box<crate::rust_fixture::RustLease>),
+    /// A process a Rust fixture started; killed on teardown.
+    Process(tokio::process::Child),
+    /// A command saved under `<run>/cleanup/` that runs on teardown, or
+    /// during garbage collection if the run died.
+    Cleanup(PathBuf),
 }
 
 pub async fn serve(root: PathBuf, store_size: u64) -> Result<()> {
@@ -141,6 +159,7 @@ pub async fn serve(root: PathBuf, store_size: u64) -> Result<()> {
         state: Mutex::default(),
         store_lock: Mutex::default(),
         glibc_needs: Mutex::default(),
+        next_part: std::sync::atomic::AtomicU64::new(1_000_000),
     });
 
     let mut stdin = tokio::io::stdin();
@@ -154,15 +173,15 @@ pub async fn serve(root: PathBuf, store_size: u64) -> Result<()> {
         };
         let Some(ClientMsg { req, body }) = msg else { break None };
         match body {
-            Request::Shutdown { keep } => break Some((req, keep)),
+            Request::Shutdown { keep, failed } => break Some((req, keep, failed)),
             body => s.clone().handle(req, body).await,
         }
     };
 
-    let keep = shutdown.as_ref().map(|(_, k)| k.clone()).unwrap_or_default();
-    s.cleanup(&keep).await;
-    if let Some((req, _)) = shutdown {
-        s.reply(req, Ok(Reply::Ok));
+    let (keep, failed) = shutdown.as_ref().map(|(_, k, f)| (k.clone(), f.clone())).unwrap_or_default();
+    let reports = s.cleanup(&keep, &failed).await;
+    if let Some((req, _, _)) = shutdown {
+        s.reply(req, Ok(Reply::ShutDown { reports }));
     }
     let _ = s.out.send(None);
     let _ = writer.await;
@@ -233,21 +252,22 @@ impl Session {
                 let res = self.memory();
                 self.reply(req, res.map(Reply::Memory).map_err(|e| e.to_string()));
             }
-            Request::Setup { lease, name, role, spec, exclusive } => {
+            Request::Setup { lease, name, role, spec, exclusive, deps } => {
                 tokio::spawn(async move {
-                    let res = fixtures::setup(&self, lease, &name, role, spec, exclusive).await;
+                    let res = fixtures::setup(&self, lease, &name, role, spec, exclusive, &deps).await;
                     self.reply(req, res.map_err(err));
                 });
             }
-            Request::Teardown { lease } => {
+            Request::Teardown { lease, failed } => {
                 tokio::spawn(async move {
                     let l = self.state.lock().unwrap().leases.remove(&lease);
                     let mut peak = None;
+                    let mut report = TeardownReport::default();
                     if let Some(l) = l {
                         peak = l.memory.as_ref().map(|m| m.sample().peak).filter(|p| *p > 0);
-                        fixtures::teardown(&self, l).await;
+                        report = fixtures::teardown(&self, l, failed).await;
                     }
-                    self.reply(req, Ok(Reply::TornDown { peak }));
+                    self.reply(req, Ok(Reply::TornDown { peak, report }));
                 });
             }
             Request::Shutdown { .. } => unreachable!("handled by the read loop"),
@@ -265,6 +285,24 @@ impl Session {
 
     pub fn add_lease(&self, id: u64, lease: Lease) {
         self.state.lock().unwrap().leases.insert(id, lease);
+    }
+
+    /// A fresh id for something a Rust fixture creates.
+    pub fn next_part(&self) -> u64 {
+        self.next_part.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The values of the Rust fixtures among `leases`, by fixture id.
+    pub fn fixture_values(&self, leases: &[u64]) -> Result<serde_json::Map<String, serde_json::Value>> {
+        let state = self.state.lock().unwrap();
+        let mut out = serde_json::Map::new();
+        for id in leases {
+            let l = state.leases.get(id).with_context(|| format!("unknown lease {id}"))?;
+            if let Some((fixture, value)) = &l.value {
+                out.insert(fixture.clone(), value.clone());
+            }
+        }
+        Ok(out)
     }
 
     fn memory(&self) -> std::io::Result<MemoryInfo> {
@@ -438,6 +476,14 @@ impl Session {
         env.insert("TMPDIR".into(), tmp.display().to_string());
         // Lets the agent find this test's processes inside a shared container.
         env.insert("XTEST_REQ".into(), req.to_string());
+        env.insert(fx::env::XTEST.into(), "1".into());
+        let values = self.fixture_values(&spec.leases)?;
+        if !values.is_empty() {
+            // Under the run's tmp dir, which environment containers see too.
+            let file = tmp.join("xtest-fixtures.json");
+            fs::write(&file, serde_json::to_vec(&values)?)?;
+            env.insert(fx::env::FIXTURES.into(), file.display().to_string());
+        }
 
         if let Some(c) = &container {
             self.check_libc(&spec.exe, c)?;
@@ -503,8 +549,8 @@ impl Session {
         Ok((exit, peak))
     }
 
-    async fn cleanup(&self, keep: &[u64]) {
-        let (procs, leases) = {
+    async fn cleanup(&self, keep: &[u64], failed: &[u64]) -> Vec<(u64, TeardownReport)> {
+        let (procs, mut leases) = {
             let mut st = self.state.lock().unwrap();
             let procs: Vec<i32> = st.procs.values().map(|p| p.pgid).collect();
             (procs, st.leases.drain().collect::<Vec<_>>())
@@ -512,12 +558,18 @@ impl Session {
         for pgid in procs {
             kill_group(pgid);
         }
+        // Newest first: a fixture is set up after the ones it depends on.
+        leases.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
         let mut kept = false;
+        let mut reports = Vec::new();
         for (id, lease) in leases {
             if keep.contains(&id) {
                 kept = true;
             } else {
-                fixtures::teardown(self, lease).await;
+                let report = fixtures::teardown(self, lease, failed.contains(&id)).await;
+                if !report.is_empty() {
+                    reports.push((id, report));
+                }
             }
         }
         if self.docker {
@@ -531,6 +583,7 @@ impl Session {
         } else if let Err(e) = gc::remove_tree(&self.run_dir) {
             eprintln!("xtest-agent: removing {}: {e}", self.run_dir.display());
         }
+        reports
     }
 }
 
@@ -594,7 +647,7 @@ fn disk_free(path: &Path) -> u64 {
     st.f_bavail as u64 * st.f_frsize as u64
 }
 
-fn kill_group(pgid: i32) {
+pub fn kill_group(pgid: i32) {
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
     }

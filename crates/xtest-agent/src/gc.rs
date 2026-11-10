@@ -187,7 +187,10 @@ pub fn collect(root: &Path, docker: bool, policy: &Policy) -> Report {
             remove_containers(&format!("label=xtest.run={id}"));
         }
     }
+    let dead_ids: Vec<String> = stale.iter().map(|(id, _)| id.clone()).collect();
+    crate::rust_fixture::kill_leftover_processes(&dead_ids);
     for (_, dir) in stale {
+        crate::rust_fixture::run_leftover_cleanups(&dir);
         match remove_tree(&dir) {
             Ok(()) => report.runs += 1,
             Err(err) => eprintln!("xtest-agent: could not remove stale run {}: {err}", dir.display()),

@@ -9,3 +9,5 @@ harness = false
 
 [dev-dependencies]
 xtest = { path = "../../crates/xtest" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["net", "io-util", "macros", "time"] }

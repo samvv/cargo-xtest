@@ -1,8 +1,8 @@
 # `#[xtest::test]`
 
 The `xtest` crate provides `#[xtest::test]`, a drop-in replacement for
-`#[test]`. Today it behaves exactly like `#[test]`; it's the base for
-declaring fixtures in code, which is still being designed.
+`#[test]`. Without parameters it behaves exactly like `#[test]`. Its
+parameters are [fixtures written in Rust](fixtures/rust.md).
 
 ```toml
 [dev-dependencies]
@@ -39,12 +39,16 @@ Other test attributes go next to it as usual: `#[ignore]`,
 `#[should_panic]`. A test may return `()` or anything libtest accepts, such
 as `Result<(), E>`.
 
+A test with fixture parameters is also `#[ignore]`d, so plain `cargo test`
+skips it; cargo-xtest runs it anyway, unless you ignored it yourself.
+
 ## Not supported
 
 These give a compile error:
 
 - `async fn` tests (planned: [#6](https://github.com/samvv/cargo-xtest/issues/6))
-- parameters, generic tests, `const`, `unsafe` and `extern` functions
+- generic tests, `const`, `unsafe` and `extern` functions
+- parameters that aren't fixtures, or that take a fixture as `&mut`
 - another test attribute below it, such as `#[test]` or `#[tokio::test]`
 
 Don't put `#[test]` *above* `#[xtest::test]` either. The macro can't see it

@@ -24,9 +24,22 @@ pub struct FixtureDef {
     /// Estimated memory of the fixture itself, in bytes.
     pub memory: u64,
     pub memory_source: MemorySource,
+    /// Fixtures this one needs set up first (Rust fixtures only).
+    pub deps: Vec<String>,
+    /// For a Rust fixture: the binaries it can be set up from.
+    pub rust: Option<crate::rust_fixtures::RustFixture>,
 }
 
 impl FixtureDef {
+    /// The spec to set it up for `case`. A Rust fixture runs from the test's
+    /// own binary when that binary has it.
+    fn spec_for(&self, case: &Case) -> FixtureSpec {
+        match &self.rust {
+            Some(r) => FixtureSpec::Rust(r.spec_for(&case.bin)),
+            None => self.spec.clone(),
+        }
+    }
+
     /// Memory to set aside for one instance in this role. A Docker
     /// environment holds only the tests that run in it, which are charged
     /// for themselves.
@@ -35,6 +48,15 @@ impl FixtureDef {
             (FixtureSpec::Docker(_), Role::Environment) => 0,
             _ => self.memory,
         }
+    }
+}
+
+/// How to show a fixture: TOML fixtures by name, Rust fixtures (keyed by
+/// `<file>#<name>`) as `name (file)`.
+pub fn fixture_display(key: &str) -> String {
+    match key.rsplit_once('#') {
+        Some((file, name)) if file.ends_with(".rs") => format!("{name} ({file})"),
+        _ => key.to_string(),
     }
 }
 
@@ -103,6 +125,8 @@ pub struct HostState {
     next_lease: AtomicU64,
     /// Leases kept for debugging, with a message for the user.
     pub kept: Mutex<Vec<(u64, String)>>,
+    /// The fixture of each lease, for reports.
+    pub lease_names: Mutex<HashMap<u64, String>>,
 }
 
 impl HostState {
@@ -114,29 +138,40 @@ impl HostState {
             reservations: Default::default(),
             next_lease: AtomicU64::new(1),
             kept: Default::default(),
+            lease_names: Default::default(),
         }
     }
 
-    async fn setup(&self, def: &FixtureDef, name: &str, role: Role) -> Result<(u64, Option<String>)> {
+    async fn setup(&self, def: &FixtureDef, name: &str, role: Role, case: &Case, deps: Vec<u64>) -> Result<(u64, Option<String>)> {
         let lease = self.next_lease.fetch_add(1, Ordering::Relaxed);
+        self.lease_names.lock().unwrap().insert(lease, name.to_string());
         let exclusive = def.scope == Scope::Test;
-        let req = Request::Setup { lease, name: name.into(), role, spec: def.spec.clone(), exclusive };
+        let req = Request::Setup { lease, name: name.into(), role, spec: def.spec_for(case), exclusive, deps };
         match self.agent.request(req).await? {
             Reply::Lease { debug_hint, .. } => Ok((lease, debug_hint)),
             other => bail!("unexpected reply to setup: {other:?}"),
         }
     }
 
-    /// Returns the lease id, and its debug hint if the lease belongs to this test only.
-    async fn lease(&self, ctx: &Ctx, name: &str, role: Role, case: &Case, slot: usize) -> Result<(u64, Option<Option<String>>)> {
+    /// Returns the lease id, and its debug hint if the lease belongs to this
+    /// test only. `deps` are the leases of the fixture's dependencies.
+    async fn lease(
+        &self,
+        ctx: &Ctx,
+        name: &str,
+        role: Role,
+        case: &Case,
+        slot: usize,
+        deps: Vec<u64>,
+    ) -> Result<(u64, Option<Option<String>>)> {
         let def = &ctx.fixtures[name];
         let key = lease_key(def, name, role, case, slot);
         let res = if def.scope == Scope::Test {
-            self.setup(def, name, role).await.map(|(id, hint)| (id, Some(hint)))
+            self.setup(def, name, role, case, deps).await.map(|(id, hint)| (id, Some(hint)))
         } else {
             let cell = self.leases.lock().await.entry(key.clone()).or_default().clone();
             let res = cell
-                .get_or_init(|| async { self.setup(def, name, role).await.map_err(|e| format!("{e:#}")) })
+                .get_or_init(|| async { self.setup(def, name, role, case, deps).await.map_err(|e| format!("{e:#}")) })
                 .await;
             match res {
                 Ok((id, _)) => Ok((*id, None)),
@@ -203,6 +238,8 @@ pub struct Ctx {
     /// `--fail-fast`: start no new tests after the first failure.
     pub fail_fast: bool,
     pub stopped: AtomicBool,
+    /// Leases used by a test that failed, so their teardown knows.
+    pub failed_leases: Arc<Mutex<BTreeSet<u64>>>,
 }
 
 impl Ctx {
@@ -356,9 +393,11 @@ fn lease_key(def: &FixtureDef, name: &str, role: Role, case: &Case, slot: usize)
     (name.to_string(), role == Role::Environment, scope)
 }
 
-/// The fixtures a test needs, with the role it uses each in.
+/// The fixtures a test needs, with the role it uses each in, in the order
+/// to set them up: `uses` is ordered so that dependencies come first, and
+/// the environment comes last (its dependencies are in `uses`).
 fn fixtures_of(case: &Case) -> impl Iterator<Item = (&String, Role)> {
-    case.run_in.iter().map(|n| (n, Role::Environment)).chain(case.uses.iter().map(|n| (n, Role::Service)))
+    case.uses.iter().map(|n| (n, Role::Service)).chain(case.run_in.iter().map(|n| (n, Role::Environment)))
 }
 
 /// Orders the queue: longest expected duration first, so a slow test doesn't
@@ -519,8 +558,12 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, last: b
     // Test-scoped leases: torn down (or kept) after this test.
     let mut own: Vec<(u64, Option<String>, LeaseKey)> = Vec::new();
     let setup: Result<()> = async {
+        let mut acquired: HashMap<&str, u64> = HashMap::new();
         for (name, role) in fixtures_of(case) {
-            let (id, owned) = host.lease(ctx, name, role, case, slot).await.with_context(|| format!("setting up fixture `{name}`"))?;
+            let deps = ctx.fixtures[name].deps.iter().map(|d| acquired[d.as_str()]).collect();
+            let (id, owned) =
+                host.lease(ctx, name, role, case, slot, deps).await.with_context(|| format!("setting up fixture `{}`", fixture_display(name)))?;
+            acquired.insert(name, id);
             leases.push(id);
             if let Some(hint) = owned {
                 own.push((id, hint, lease_key(&ctx.fixtures[name], name, role, case, slot)));
@@ -586,8 +629,13 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, last: b
         }
     };
 
+    let mut outcome = outcome;
     let failed = outcome.status != Status::Pass;
-    for (id, hint, key) in own {
+    if failed && last {
+        ctx.failed_leases.lock().unwrap().extend(leases.iter().copied());
+    }
+    // Newest first: a fixture is set up after the ones it depends on.
+    for (id, hint, key) in own.into_iter().rev() {
         if failed && last && ctx.keep_fixtures {
             let msg = format!(
                 "kept fixture for {} on `{}`{}",
@@ -597,13 +645,36 @@ async fn run_case(ctx: &Ctx, host: &HostState, case: &Case, slot: usize, last: b
             );
             host.kept.lock().unwrap().push((id, msg));
         } else {
-            if let Ok(Reply::TornDown { peak: Some(peak) }) = host.agent.request(Request::Teardown { lease: id }).await {
-                ctx.record_fixture(&key.0, peak);
+            if let Ok(Reply::TornDown { peak, report }) = host.agent.request(Request::Teardown { lease: id, failed }).await {
+                if let Some(peak) = peak {
+                    ctx.record_fixture(&key.0, peak);
+                }
+                if let Some(e) = &report.error {
+                    ctx.reporter.warn(&format!("{}: {e}", case.display()));
+                }
+                outcome.output.0.extend(report_output(&key.0, &report));
             }
             host.reservations.lock().unwrap().remove(&key);
         }
     }
     outcome
+}
+
+/// A teardown report as output to show with the test (stderr).
+pub fn report_output(fixture: &str, report: &TeardownReport) -> Vec<(Stream, Vec<u8>)> {
+    let mut out = Vec::new();
+    if let Some(e) = &report.error {
+        out.push((Stream::Stderr, format!("\n--- {e}\n").into_bytes()));
+    }
+    for (name, data) in &report.attachments {
+        let mut text = format!("\n--- {name} (attached by fixture `{}`) ---\n", fixture_display(fixture)).into_bytes();
+        text.extend_from_slice(data);
+        if !text.ends_with(b"\n") {
+            text.push(b'\n');
+        }
+        out.push((Stream::Stderr, text));
+    }
+    out
 }
 
 #[derive(Default)]
