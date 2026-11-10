@@ -281,7 +281,11 @@ pub async fn sync(agent: &Agent, files: &FileSet) -> Result<(usize, u64)> {
 }
 
 /// Lists the tests in every binary. Returns (binary, test name, ignored).
-pub async fn discover(agent: &Agent, bins: &[Arc<TestBinary>]) -> Result<Vec<(Arc<TestBinary>, String, bool)>> {
+pub async fn discover(
+    agent: &Agent,
+    bins: &[Arc<TestBinary>],
+    reporter: &Reporter,
+) -> Result<Vec<(Arc<TestBinary>, String, bool)>> {
     let mut out = Vec::new();
     for bin in bins {
         if !bin.harness {
@@ -308,7 +312,14 @@ pub async fn discover(agent: &Agent, bins: &[Arc<TestBinary>]) -> Result<Vec<(Ar
             let text = String::from_utf8_lossy(&r.output.of(Stream::Stdout)).into_owned();
             Ok(text.lines().filter_map(|l| l.strip_suffix(": test")).map(String::from).collect())
         };
-        let all = parse(agent.run(list(None)).await?)?;
+        let (all, dups) = dedup(parse(agent.run(list(None)).await?)?);
+        for name in dups {
+            reporter.warn(&format!(
+                "{}: `{name}` is listed more than once; running it once. \
+                 Is it marked with both #[test] and #[xtest::test]?",
+                bin.id()
+            ));
+        }
         let ignored: BTreeSet<String> = parse(agent.run(list(Some("--ignored"))).await?)?.into_iter().collect();
         for name in all {
             let ig = ignored.contains(&name);
@@ -316,6 +327,24 @@ pub async fn discover(agent: &Agent, bins: &[Arc<TestBinary>]) -> Result<Vec<(Ar
         }
     }
     Ok(out)
+}
+
+/// Removes repeated test names, keeping the first. Returns the names and the
+/// repeated ones. libtest lists a test twice when two test attributes are
+/// applied to it, e.g. `#[test]` above `#[xtest::test]`; `--exact` would then
+/// run it twice in one process.
+fn dedup(names: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut seen = BTreeSet::new();
+    let mut dups = BTreeSet::new();
+    let mut unique = Vec::new();
+    for name in names {
+        if seen.insert(name.clone()) {
+            unique.push(name);
+        } else {
+            dups.insert(name);
+        }
+    }
+    (unique, dups.into_iter().collect())
 }
 
 fn lease_key(def: &FixtureDef, name: &str, role: Role, case: &Case, slot: usize) -> LeaseKey {
@@ -775,6 +804,14 @@ impl Reporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedup_keeps_the_first_of_each_name() {
+        let names = ["b", "a", "b", "c", "b", "a"].map(String::from).to_vec();
+        let (unique, dups) = dedup(names);
+        assert_eq!(unique, ["b", "a", "c"]);
+        assert_eq!(dups, ["a", "b"]);
+    }
 
     fn case(name: &str, memory: u64, expected: Option<u64>) -> Case {
         let bin = TestBinary {

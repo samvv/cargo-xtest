@@ -1,5 +1,5 @@
 // Uses the `greeter` command fixture (see .config/xtest.toml).
-#[test]
+#[xtest::test]
 #[ignore = "needs the greeter fixture; run with `cargo xtest`"]
 fn gets_greeting_from_fixture() {
     let state = std::env::var("GREETER_STATE").unwrap();

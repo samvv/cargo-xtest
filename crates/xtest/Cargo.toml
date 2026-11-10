@@ -1,0 +1,9 @@
+[package]
+name = "xtest"
+description = "Test attributes for cargo-xtest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xtest-macros = { path = "../xtest-macros", version = "0.1.0" }

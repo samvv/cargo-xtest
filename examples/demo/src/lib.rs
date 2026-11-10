@@ -2,6 +2,14 @@ pub fn add(a: i32, b: i32) -> i32 {
     a + b
 }
 
+pub fn quadruple(a: i32) -> i32 {
+    double(double(a))
+}
+
+fn double(a: i32) -> i32 {
+    add(a, a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9,6 +17,12 @@ mod tests {
     #[test]
     fn adds() {
         assert_eq!(add(2, 2), 4);
+    }
+
+    // #[xtest::test] in a unit test, calling a private function.
+    #[xtest::test]
+    fn doubles() {
+        assert_eq!(double(21), 42);
     }
 
     #[test]
@@ -25,7 +39,7 @@ mod tests {
         std::fs::write(tmp.join("scratch"), "x").unwrap();
     }
 
-    #[test]
+    #[xtest::test]
     #[ignore = "only runs with --include-ignored"]
     fn slow_one() {}
 }

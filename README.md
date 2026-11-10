@@ -86,6 +86,12 @@ The [documentation](docs/README.md) covers the rest:
 [command](docs/fixtures/command.md), [k3d](docs/fixtures/k3d.md)),
 [memory scheduling](docs/memory-scheduling.md) and [cleanup](docs/cleanup.md).
 
+## Writing tests
+
+Plain `#[test]` functions work as they are. The optional `xtest` crate adds
+[`#[xtest::test]`](docs/xtest-test.md), a drop-in replacement for `#[test]`
+that will be the base for declaring fixtures in code.
+
 ## CLI
 
 ### `cargo xtest`

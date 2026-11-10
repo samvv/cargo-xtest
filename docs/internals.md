@@ -10,6 +10,7 @@ How cargo-xtest works inside, for contributors. For using it, start at the
 | `crates/cargo-xtest` | the controller: CLI, config, build, file sync, scheduling, reporting. Also ships the `xtest-agent` binary. |
 | `crates/xtest-agent` | the agent on each host: blob store, sandbox, processes, fixtures, cleanup |
 | `crates/xtest-proto` | the wire protocol between the two |
+| `crates/xtest`, `crates/xtest-macros` | `#[xtest::test]`, used in the tests themselves |
 | `examples/demo` | a workspace that exercises every feature |
 
 The controller runs on your machine. It starts one agent per host (over SSH,

@@ -250,7 +250,7 @@ fn run(args: Args) -> Result<ExitCode> {
                 check_glibc(&h.agent, &built.executables, &needs)?;
             }
             let bins: Vec<_> = built.tests.into_iter().map(Arc::new).collect();
-            let found = runner::discover(&hosts[0].agent, &bins).await?;
+            let found = runner::discover(&hosts[0].agent, &bins, &reporter).await?;
 
             let mut cases = Vec::new();
             let mut skipped = 0;
