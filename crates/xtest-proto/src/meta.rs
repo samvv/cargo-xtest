@@ -40,7 +40,7 @@ pub const fn record_len(pairs: &[&str]) -> usize {
 /// `N`, which must be [`record_len(pairs)`](record_len).
 pub const fn record<const N: usize>(pairs: &[&str]) -> [u8; N] {
     assert!(N == record_len(pairs), "wrong record length");
-    assert!(pairs.len() % 2 == 0, "pairs must be key, value, key, value, ...");
+    assert!(pairs.len().is_multiple_of(2), "pairs must be key, value, key, value, ...");
     let mut out = [0u8; N];
     let mut at = 0;
     while at < MAGIC.len() {
