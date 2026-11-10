@@ -67,6 +67,8 @@ With `run-in`, the test process runs inside the container (through
   needed;
 - has the run's sandbox mounted at its original absolute paths, so the test
   sees the same paths as on your machine;
+- gives each test its own `TMPDIR` on the container's own disk
+  (`/tmp/xtest-<request>`), not on a mounted folder;
 - starts with `sleep infinity` as entrypoint, so it stays up until teardown.
 
 The test binary is built on your machine and runs unchanged in the image. The

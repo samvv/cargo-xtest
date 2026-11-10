@@ -2,6 +2,7 @@
 //! Whatever happens to the connection, `cleanup` tears everything down.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -473,7 +474,13 @@ impl Session {
         let (lease_env, container) = self.lease_env(&spec.leases, &spec.env)?;
         let mut env = spec.env.clone();
         env.extend(lease_env);
-        env.insert("TMPDIR".into(), tmp.display().to_string());
+        // In a container, temp files go on the container's own disk rather
+        // than the bind mount, which may be slower or lack features tests need.
+        let ctr_tmp = match &container {
+            Some(c) => Some(container_tmp(&c.name, &tmp, req).await?),
+            None => None,
+        };
+        env.insert("TMPDIR".into(), ctr_tmp.as_deref().unwrap_or(&tmp).display().to_string());
         // Lets the agent find this test's processes inside a shared container.
         env.insert("XTEST_REQ".into(), req.to_string());
         env.insert(fx::env::XTEST.into(), "1".into());
@@ -526,6 +533,11 @@ impl Session {
         })
         .await;
         let _ = gc::remove_tree(&tmp);
+        if let (Some(c), Some(dir)) = (&container, &ctr_tmp) {
+            // Best effort: the image may have no `rm`, and teardown removes
+            // the container anyway.
+            let _ = fixtures::docker([OsStr::new("exec"), c.name.as_ref(), "rm".as_ref(), "-rf".as_ref(), dir.as_os_str()]).await;
+        }
 
         let peak = match (&container, sampler) {
             (None, _) => Some(max_rss),
@@ -585,6 +597,22 @@ impl Session {
         }
         reports
     }
+}
+
+/// Makes a temp dir for request `req` on `ctr`'s own disk. It's copied in from
+/// the empty host dir `empty` with `docker cp -a`, which keeps the agent's uid
+/// as owner and needs no tools in the image.
+async fn container_tmp(ctr: &str, empty: &Path, req: u64) -> Result<PathBuf> {
+    let dir = PathBuf::from(format!("/tmp/xtest-{req}"));
+    fixtures::docker([
+        OsStr::new("cp"),
+        "-a".as_ref(),
+        empty.as_os_str(),
+        format!("{ctr}:{}", dir.display()).as_ref(),
+    ])
+    .await
+    .with_context(|| format!("making {} in the container", dir.display()))?;
+    Ok(dir)
 }
 
 fn pump(

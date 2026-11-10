@@ -137,7 +137,7 @@ store is always complete.
 |---|---|
 | `lock` | held (`flock`) for as long as the run is alive |
 | `root/<absolute path>` | the sandbox: every synced file at its original path |
-| `tmp/<request>` | each test process's `TMPDIR` |
+| `tmp/<request>` | each test process's `TMPDIR`, and its fixture-values file; in an environment container only the fixture-values file, which the container sees through a mount |
 | `keep` | present if fixtures were kept with `--keep-fixtures` |
 
 Executables are hardlinked from the store, which is fast and saves space.
